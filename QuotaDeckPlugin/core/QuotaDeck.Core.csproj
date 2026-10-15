@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    QuotaDeck core: the provider-agnostic state engine.
+
+    Pure C# with no SDK dependency and no NuGet packages beyond the BCL, so every rule here is
+    testable with plain xunit and can be reasoned about without the Logi Plugin Service present.
+    The plugin project references this library; provider readers (phases 3+) subclass
+    QuotaDeck.Core.Readers.UsageReaderBase.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>QuotaDeck.Core</RootNamespace>
+    <AssemblyName>QuotaDeck.Core</AssemblyName>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+</Project>
