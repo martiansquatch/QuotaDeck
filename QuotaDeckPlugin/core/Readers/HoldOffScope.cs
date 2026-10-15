@@ -20,10 +20,12 @@ public enum HoldOffScope
     WholeRead,
 
     /// <summary>
-    /// The base skips its own check and exposes <c>HoldOffUntil</c> and <c>IsHeldOff(now)</c>; the
-    /// reader applies the deadline to the steps that need it — an endpoint fetch, say — and lets
-    /// its other sources answer. The base records hold-offs from 429s and clears them on success
-    /// exactly as it does for <see cref="WholeRead"/>.
+    /// The base skips its own check and exposes <c>LoadHoldOffUntil()</c> and <c>IsHeldOff(now)</c>;
+    /// the reader applies the deadline to the steps that need it — an endpoint fetch, say — and
+    /// lets its other sources answer, calling <c>MarkRateLimitedSourceConsulted()</c> just before
+    /// the held-off request so the base knows whether a returned reading or a replayed hold-off may
+    /// move the ladder. The base records hold-offs from 429s and clears them on success exactly as
+    /// it does for <see cref="WholeRead"/>.
     /// </summary>
     ReaderManaged,
 }

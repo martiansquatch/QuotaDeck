@@ -100,9 +100,12 @@ rungs.
 
 A persisted deadline suppresses the reader's whole fetch by default: no source is tried until it
 expires. A reader with several sources can take the `ReaderManaged` hold-off scope instead — the
-base skips its own check and still records and clears the deadline, while the reader consults
-`IsHeldOff(now)` on the steps that need it and lets its other sources answer. That is the shape of
-Codenotch's Claude provider, whose hold-off sits inside the keychain step
+base skips its own check, while the reader consults `IsHeldOff(now)` and `LoadHoldOffUntil()` on
+the steps that need it and lets its other sources answer. Such a reader calls
+`MarkRateLimitedSourceConsulted()` immediately before the held-off request, because only a reading
+that actually asked that source may reset the ladder and clear the deadline on success — or take a
+rung and write one on a 429; a replayed hold-off and a cache answer leave both alone. That is the
+shape of Codenotch's Claude provider, whose hold-off sits inside the keychain step
 (`Sources/Providers/ClaudeOAuthProvider.swift:303-309`) after the Desktop cache and CLI steps have
 had their chance; the Claude reader adopts it in a follow-up.
 

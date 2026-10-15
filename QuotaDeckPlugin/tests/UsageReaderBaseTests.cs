@@ -215,49 +215,167 @@ public class UsageReaderBaseTests
     }
 
     /// <summary>
-    /// ReaderManaged skips the base's pre-read check entirely: the reader gets to try its other
-    /// sources while the endpoint is held off, exactly like Codenotch's Claude provider, whose
-    /// hold-off sits inside the keychain step (ClaudeOAuthProvider.swift:303-309).
+    /// ReaderManaged skips the base's pre-read check entirely — the reader gets to try its other
+    /// sources while the endpoint is held off — and a read that never consulted the held-off source
+    /// replays the hold-off instead of reporting a new 429: no rung, no deadline write, and a dimmed
+    /// reading keeps its own FetchedAt as the Stale since (ClaudeOAuthProvider.swift:303-309).
     /// </summary>
     [Fact]
-    public async Task ReaderManagedScopeSkipsTheBaseHoldOffCheck()
+    public async Task AReplayedHoldOffTakesNoRungAndKeepsTheOriginalSince()
     {
+        var originalFetchedAt = TestData.Now.AddMinutes(-20);
+        this._store.Seed("test", TestData.SessionAndWeekly(0.5, 0.4), originalFetchedAt);
         this._store.SaveBackoffUntil("test", TestData.Now.AddMinutes(30));
         var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
-        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited(TimeSpan.FromMinutes(30)));
+
+        // No hint: were this treated as a new 429, the deadline would move to Now+60.
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited());
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
 
+        // The read was called (that is the point of ReaderManaged) and the replay degraded the old
+        // reading in place: the same number, the same since, the store untouched.
         Assert.Equal(1, reader.Calls);
         Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
+        Assert.Equal(originalFetchedAt, snapshot.Status.StaleSince);
+        Assert.Equal(0.5, snapshot.UsedFraction!.Value, 10);
+        Assert.Equal(originalFetchedAt, this._store.Load("test")!.FetchedAt);
         Assert.Equal(TestData.Now.AddMinutes(30), this._store.LoadBackoffUntil("test"));
+
+        // A second replay sees exactly the same: no state from the first leaks into the next cycle.
+        var second = await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(ProviderStatusKind.Stale, second.Status.Kind);
+        Assert.Equal(originalFetchedAt, second.Status.StaleSince);
+        Assert.Equal(originalFetchedAt, this._store.Load("test")!.FetchedAt);
+        Assert.Equal(TestData.Now.AddMinutes(30), this._store.LoadBackoffUntil("test"));
+
+        // And no rung was spent: a real 429 next is still the ladder's first.
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
     }
 
     /// <summary>
-    /// A ReaderManaged read can see the deadline for itself and apply it to the step that needs it;
-    /// a success still clears it, exactly like a WholeRead reader's.
+    /// A ReaderManaged read that DID consult the held-off source answers for it: a success resets
+    /// the ladder and clears the deadline, exactly like a WholeRead reader's.
     /// </summary>
     [Fact]
-    public async Task ReaderManagedScopeLetsTheReadApplyTheHoldOffItself()
+    public async Task AConsultedSuccessResetsTheLadderAndClearsTheDeadline()
     {
-        this._store.SaveBackoffUntil("test", TestData.Now.AddMinutes(30));
         var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+
+        // Two real 429s climb the ladder: 60 s, then 120 s.
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+        this._clock.Now = TestData.Now.AddSeconds(61);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 120), this._store.LoadBackoffUntil("test"));
+
+        // A consulted success clears the deadline and resets the ladder. Still inside the hold-off,
+        // so the read sees it for itself.
+        this._clock.Now = TestData.Now.AddSeconds(61 + 61);
         bool? heldOffInRead = null;
         DateTimeOffset? deadlineInRead = null;
         reader.OnRead = (_, _) =>
         {
             heldOffInRead = reader.HeldOffNow();
             deadlineInRead = reader.HoldOffDeadline();
+            reader.MarkConsulted();
             return Task.FromResult(TestData.SessionAndWeekly(0.4, 0.2));
         };
-
         var snapshot = await reader.FetchAsync(Freshness.Standard);
-
-        Assert.Equal(1, reader.Calls);
-        Assert.True(heldOffInRead);
-        Assert.Equal(TestData.Now.AddMinutes(30), deadlineInRead);
         Assert.Equal(ProviderStatusKind.Ok, snapshot.Status.Kind);
+        Assert.True(heldOffInRead);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 120), deadlineInRead);
         Assert.Null(this._store.LoadBackoffUntil("test"));
+
+        // One more real 429 starts at the first rung again.
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 61 + 60), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>
+    /// A reading that never asked the held-off source — a Desktop or CLI answer — is stored as
+    /// last-good, but it says nothing about that source: the ladder and the deadline are unchanged,
+    /// so the next real 429 is a rung further up, not the first.
+    /// </summary>
+    [Fact]
+    public async Task AReturnedReadingWithoutAConsultedSourceKeepsTheLadderAndDeadline()
+    {
+        var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+
+        // Climb to the second rung so the counter's fate is observable.
+        await reader.FetchAsync(Freshness.Standard);
+        this._clock.Now = TestData.Now.AddSeconds(61);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 120), this._store.LoadBackoffUntil("test"));
+
+        // The unmarked answer is a fresh reading and is remembered as such...
+        this._clock.Now = TestData.Now.AddSeconds(61 + 121);
+        reader.OnRead = (_, _) => Task.FromResult(TestData.SessionAndWeekly(0.3, 0.1));
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(ProviderStatusKind.Ok, snapshot.Status.Kind);
+        Assert.Equal(this._clock.Now, this._store.Load("test")!.FetchedAt);
+
+        // ...but it moved neither the ladder nor the deadline.
+        Assert.Equal(TestData.Now.AddSeconds(61 + 120), this._store.LoadBackoffUntil("test"));
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(this._clock.Now.AddSeconds(240), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>A consulted 429 is the real thing: it takes the ladder's next rung.</summary>
+    [Fact]
+    public async Task AConsultedRateLimitTakesTheLadderRung()
+    {
+        var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+
+        // A replay in between spends nothing...
+        this._clock.Now = TestData.Now.AddSeconds(61);
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited());
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+
+        // ...so the second real 429 is the second rung: 120 s.
+        this._clock.Now = TestData.Now.AddSeconds(62);
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(62 + 120), this._store.LoadBackoffUntil("test"));
     }
 
     [Fact]
@@ -540,6 +658,123 @@ public class UsageReaderBaseTests
         Assert.Equal(1, looks.Calls);
     }
 
+    /// <summary>
+    /// A real 429 from a cycle a look superseded mid-read still takes its rung and writes its
+    /// deadline: the verdict is judged from the cycle that consulted the endpoint, not from the
+    /// reader, so the newer cycle's fresh state cannot erase it.
+    /// </summary>
+    [Fact]
+    public async Task ARealRateLimitFromASupersededCycleStillTakesItsRung()
+    {
+        var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+        var aStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var aMarked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseA = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseARateLimit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        reader.OnRead = async (freshness, _) =>
+        {
+            if (freshness == Freshness.Standard)
+            {
+                aStarted.SetResult();
+                await releaseA.Task;
+                reader.MarkConsulted();
+                aMarked.SetResult();
+                await releaseARateLimit.Task;
+                throw new ReaderException(ReaderError.RateLimited());
+            }
+
+            bStarted.SetResult();
+            await releaseB.Task;
+            return TestData.SessionAndWeekly(0.4, 0.2);
+        };
+
+        var fetchA = reader.FetchAsync(Freshness.Standard);
+        await aStarted.Task;
+
+        // A reaches its endpoint and marks; the look then starts and supersedes it while A is
+        // still waiting for the answer.
+        releaseA.SetResult();
+        await aMarked.Task;
+        var fetchB = reader.FetchAsync(Freshness.FromSource);
+        await bStarted.Task;
+
+        // A's endpoint answers 429 after the look began: A's own verdict still stands.
+        releaseARateLimit.SetResult();
+        var aSnapshot = await fetchA;
+        Assert.Equal(ProviderStatusKind.Stale, aSnapshot.Status.Kind);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+
+        releaseB.SetResult();
+        var bSnapshot = await fetchB;
+        Assert.Equal(ProviderStatusKind.Ok, bSnapshot.Status.Kind);
+    }
+
+    /// <summary>
+    /// A look's unmarked reading — a Desktop or CLI answer — leaves the ladder and the deadline
+    /// alone even while the older cycle has already marked its own endpoint visit: the newer
+    /// cycle's success is judged from its own state, not from the other cycle's claim.
+    /// </summary>
+    [Fact]
+    public async Task AnUnmarkedSupersedingAnswerLeavesTheLadderAndDeadlineAlone()
+    {
+        var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+
+        // Two real 429s first, so the ladder is at its second rung and a deadline is stored.
+        reader.OnRead = (_, _) =>
+        {
+            reader.MarkConsulted();
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+        await reader.FetchAsync(Freshness.Standard);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(120), this._store.LoadBackoffUntil("test"));
+
+        var aStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var aMarked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseA = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseARateLimit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        reader.OnRead = async (freshness, _) =>
+        {
+            if (freshness == Freshness.Standard)
+            {
+                aStarted.SetResult();
+                await releaseA.Task;
+                reader.MarkConsulted();
+                aMarked.SetResult();
+                await releaseARateLimit.Task;
+                throw new ReaderException(ReaderError.RateLimited());
+            }
+
+            bStarted.SetResult();
+            await releaseB.Task;
+            return TestData.SessionAndWeekly(0.4, 0.2);
+        };
+
+        var fetchA = reader.FetchAsync(Freshness.Standard);
+        await aStarted.Task;
+        var fetchB = reader.FetchAsync(Freshness.FromSource);
+        await bStarted.Task;
+
+        // A has marked; the look's unmarked answer lands now. It must not clear the deadline or
+        // reset the ladder for a reading that never asked the endpoint.
+        releaseA.SetResult();
+        await aMarked.Task;
+        releaseB.SetResult();
+        var bSnapshot = await fetchB;
+        Assert.Equal(ProviderStatusKind.Ok, bSnapshot.Status.Kind);
+        Assert.Equal(TestData.Now.AddSeconds(120), this._store.LoadBackoffUntil("test"));
+
+        // A's own 429 lands last and is the third rung: the counter the look left alone.
+        releaseARateLimit.SetResult();
+        var aSnapshot = await fetchA;
+        Assert.Equal(0.4, aSnapshot.UsedFraction!.Value, 10);
+        Assert.Equal(TestData.Now.AddSeconds(240), this._store.LoadBackoffUntil("test"));
+    }
+
     /// <summary>The stamp is when the read came back, not when it was asked for.</summary>
     [Fact]
     public async Task FetchedAtIsStampedWhenTheReadReturns()
@@ -609,7 +844,10 @@ public class UsageReaderBaseTests
         public bool HeldOffNow() => this.IsHeldOff(this._time.GetUtcNow());
 
         /// <summary>The stored deadline, as a ReaderManaged read would read it.</summary>
-        public DateTimeOffset? HoldOffDeadline() => this.HoldOffUntil;
+        public DateTimeOffset? HoldOffDeadline() => this.LoadHoldOffUntil();
+
+        /// <summary>What a ReaderManaged read calls before asking the held-off source.</summary>
+        public void MarkConsulted() => this.MarkRateLimitedSourceConsulted();
 
         protected override HoldOffScope HoldOffScope => this.Scope;
 
