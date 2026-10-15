@@ -9,6 +9,8 @@ namespace QuotaDeck.Core.Readers.Services;
 /// endpoints get different budgets, and a timeout must read as
 /// <see cref="ReaderException"/> with <see cref="ReaderError.TimedOut"/> — never as a cancellation —
 /// so the reader base's cancellation guard cannot mistake a slow endpoint for a caller who left.
+/// The budget covers the whole exchange, body included: an implementation that returns at the
+/// response headers would let a stalled body outlive the timeout.
 /// </summary>
 public interface IHttpTransport
 {
