@@ -185,8 +185,8 @@ public sealed class ClaudeUsageCli : IClaudeUsageCli
     /// <summary>
     /// The lines <c>/usage</c> leads with, e.g.
     /// <code>
-    /// Current session: 38% used · resets Sep 7 at 2:59pm (Asia/Jakarta)
-    /// Current week (all models): 4% used · resets Sep 14 at 5:59am (Asia/Jakarta)
+    /// Current session: 38% used · resets Sep 7 at 2:59pm (Europe/Berlin)
+    /// Current week (all models): 4% used · resets Sep 14 at 5:59am (Europe/Berlin)
     /// </code>
     /// Everything below them is prose about what drove the usage, and is ignored — it is
     /// approximate by its own admission, and none of it is a limit.
@@ -295,7 +295,7 @@ public sealed class ClaudeUsageCli : IClaudeUsageCli
     }
 
     /// <summary>
-    /// <c>Sep 7 at 2:59pm (Asia/Jakarta)</c> → a moment.
+    /// <c>Sep 7 at 2:59pm (Europe/Berlin)</c> → a moment.
     ///
     /// No year is printed, so one is chosen: the candidate nearest <paramref name="now"/>, over last
     /// year, this year and next.

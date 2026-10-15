@@ -102,6 +102,7 @@ public sealed class ClaudeReader : UsageReaderBase
     private readonly ClaudeKeychain _claudeKeychain;
     private readonly ClaudeDesktopUsageCache _desktopCache;
     private readonly TimeProvider _time;
+    /// <summary>Lazily made, so a reader that never refreshes a token never touches the filesystem.</summary>
     private readonly Lazy<string> _scratchDirectory;
 
     private readonly TimeSpan _desktopFreshness;
@@ -184,7 +185,7 @@ public sealed class ClaudeReader : UsageReaderBase
             reload: this.ReloadTokenExpiryAsync,
             cli: () => refreshCli.Value,
             process: options.Context.Process,
-            scratchDirectory: this._scratchDirectory.Value);
+            scratchDirectory: () => this._scratchDirectory.Value);
     }
 
     public override string Id => this._profile.Id;

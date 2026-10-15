@@ -58,7 +58,10 @@ public sealed class ClaudeProfile
 
     public string ConfigDirectory { get; }
 
-    /// <summary>The account these keychain items are filed under — this user's.</summary>
+    /// <summary>
+    /// The account this login's keychain items are filed under — this user's. Used by the rescue
+    /// that reads an item by name through <c>/usr/bin/security</c>, not by the enumeration.
+    /// </summary>
     public string Account { get; }
 
     /// <summary><c>claude</c> for the default, <c>claude-&lt;slug&gt;</c> for the rest.</summary>
@@ -132,9 +135,16 @@ public sealed class ClaudeProfile
         return profiles;
     }
 
-    /// <summary>Whether Claude Code has ever filed a token for this profile's directory.</summary>
+    /// <summary>
+    /// Whether Claude Code has ever filed a token for this profile's directory.
+    ///
+    /// The account is not part of the query, the same as Codenotch's
+    /// <c>KeychainItem.newest(services:)</c>: the item is asked for by service, and the account is
+    /// only ever *used* on the rescue that reads it by name. Deliberately not a check on whether the
+    /// token is valid — an expired one still means the account exists and the ring is worth drawing.
+    /// </summary>
     public static bool HasKeychainCredential(ClaudeProfile profile, IKeychain keychain) =>
-        KeychainQuery.Newest(keychain, profile.KeychainServices, profile.Account) is not null;
+        KeychainQuery.Newest(keychain, profile.KeychainServices) is not null;
 
     /// <summary><c>.claude-work</c> → <c>work</c>; anything else → nil.</summary>
     public static string? SlugFromDirectoryName(string name)

@@ -61,7 +61,7 @@ public sealed class ClaudeTokenRefresher
     private readonly Func<CancellationToken, Task<DateTimeOffset?>> _reload;
     private readonly Func<string?> _cli;
     private readonly IProcessRunner _process;
-    private readonly string _scratchDirectory;
+    private readonly Func<string> _scratchDirectory;
     private readonly TimeSpan _margin;
     private readonly TimeSpan _cooldown;
     private readonly TimeSpan _timeout;
@@ -75,7 +75,7 @@ public sealed class ClaudeTokenRefresher
         Func<CancellationToken, Task<DateTimeOffset?>> reload,
         Func<string?> cli,
         IProcessRunner process,
-        string scratchDirectory,
+        Func<string> scratchDirectory,
         TimeSpan? margin = null,
         TimeSpan? cooldown = null,
         TimeSpan? timeout = null)
@@ -172,6 +172,17 @@ public sealed class ClaudeTokenRefresher
                 return;
             }
 
+            string scratch;
+            try
+            {
+                scratch = this._scratchDirectory();
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                this.Fail("Couldn't prepare a working directory for `claude`.");
+                return;
+            }
+
             try
             {
                 var result = await this._process.RunAsync(
@@ -181,10 +192,10 @@ public sealed class ClaudeTokenRefresher
                         Arguments = Arguments.ToList(),
 
                         // The same fixed directory `/usage` runs from, never the plugin's own.
-                        WorkingDirectory = this._scratchDirectory,
+                        WorkingDirectory = scratch,
                         Environment = new Dictionary<string, string?>(StringComparer.Ordinal)
                         {
-                            ["PWD"] = this._scratchDirectory,
+                            ["PWD"] = scratch,
                         },
                         CaptureStandardError = false,
                         Timeout = this._timeout,

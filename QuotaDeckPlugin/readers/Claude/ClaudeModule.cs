@@ -18,12 +18,19 @@ public sealed class ClaudeModule : IProviderModule
     /// <summary>Nil in production: the home directory is computed at runtime, never spelled out here.</summary>
     private readonly string? _home;
 
+    /// <summary>Nil in production: the presence probe asks the login keychain itself.</summary>
+    private readonly IKeychain? _keychain;
+
     public ClaudeModule()
     {
     }
 
-    /// <summary>A module reading a home directory a test controls.</summary>
-    internal ClaudeModule(string homeDirectory) => this._home = homeDirectory;
+    /// <summary>A module reading a home directory a test controls, and a keychain a test scripts.</summary>
+    public ClaudeModule(string homeDirectory, IKeychain? keychain = null)
+    {
+        this._home = homeDirectory;
+        this._keychain = keychain;
+    }
 
     public string ProviderId => ClaudeReader.ProviderId;
 
@@ -52,6 +59,6 @@ public sealed class ClaudeModule : IProviderModule
         }
 
         var profile = ClaudeProfile.Default(home, fileSystem);
-        return KeychainQuery.Newest(new MacKeychain(), profile.KeychainServices, profile.Account) is not null;
+        return KeychainQuery.Newest(this._keychain ?? new MacKeychain(), profile.KeychainServices) is not null;
     }
 }
