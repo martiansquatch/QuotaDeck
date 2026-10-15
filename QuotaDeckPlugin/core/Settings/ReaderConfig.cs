@@ -29,6 +29,17 @@ public sealed class ReaderConfig
     [JsonPropertyName("staleAfterMinutes")]
     public double StaleAfterMinutes { get; set; } = RefreshSchedule.StaleAfterMinutes;
 
+    /// <summary>
+    /// How this reader waits after a 429: the <see cref="RateLimitBackoff.Ladder"/> (the default;
+    /// Claude, OpenCode) or the flat <see cref="RateLimitBackoff.Flat"/> (Codex, Devin, Muse).
+    /// Written as a name in config.json. A reader whose provider's Swift counterpart pins a choice
+    /// says so in its own file and this value is not consulted — see
+    /// <c>UsageReaderBase.RateLimitBackoffStyle</c>.
+    /// </summary>
+    [JsonPropertyName("rateLimitBackoff")]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public RateLimitBackoff RateLimitBackoff { get; set; } = RateLimitBackoff.Ladder;
+
     public TimeSpan BusyInterval => TimeSpan.FromSeconds(this.BusyIntervalSeconds);
 
     public TimeSpan IdleInterval => TimeSpan.FromSeconds(this.IdleIntervalSeconds);
@@ -38,12 +49,17 @@ public sealed class ReaderConfig
     /// <summary>
     /// Repairs values a hand-edited config could carry. Not a Swift port: the intervals are
     /// QuotaDeck's own surface, and a zero or negative one would either busy-poll or never poll.
+    /// The backoff choice is repaired too — the string reader refuses a name it does not know, but
+    /// a bare number can still land outside the enum.
     /// </summary>
     public void Normalize()
     {
         this.BusyIntervalSeconds = Positive(this.BusyIntervalSeconds, RefreshSchedule.BusyIntervalSeconds);
         this.IdleIntervalSeconds = Positive(this.IdleIntervalSeconds, RefreshSchedule.IdleIntervalSeconds);
         this.StaleAfterMinutes = Positive(this.StaleAfterMinutes, RefreshSchedule.StaleAfterMinutes);
+        this.RateLimitBackoff = Enum.IsDefined(this.RateLimitBackoff)
+            ? this.RateLimitBackoff
+            : RateLimitBackoff.Ladder;
     }
 
     private static double Positive(double value, double fallback) =>

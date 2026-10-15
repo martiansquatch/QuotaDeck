@@ -75,11 +75,22 @@ killall LogiPluginService
   always judged by the *used* fraction, whichever end the figures show.
 - `watchLimit` / `criticalLimit` are the band boundaries. They are clamped on load: the watch limit
   stays below the critical limit, and the pair inside 0.01–1.0.
-- `providers` is per-reader enablement and schedule, keyed by reader id: `enabled`,
-  `busyIntervalSeconds`, `idleIntervalSeconds`, `staleAfterMinutes`. A provider missing from the file
-  gets the defaults (enabled, 30 s busy, 5 min idle, 15 min stale).
+- `providers` is per-reader enablement, schedule and rate-limit behaviour, keyed by reader id:
+  `enabled`, `busyIntervalSeconds`, `idleIntervalSeconds`, `staleAfterMinutes`,
+  `rateLimitBackoff`. A provider missing from the file gets the defaults (enabled, 30 s busy, 5 min
+  idle, 15 min stale, `"Ladder"`).
 - `order` is the face order (provider ids, first is leftmost). Stored ids no provider claims are
   ignored, and providers the order has never seen are appended at the end.
+
+The 429 wait follows the provider, and each choice ports its Swift counterpart: `"Ladder"` (the
+default) starts at 60 s, doubles for each 429 in a row and stops at 900 s with the server's
+`Retry-After` only ever raising the floor — Codenotch's Claude
+(`Sources/Providers/ClaudeOAuthProvider.swift`, `backoff(forAttempt:retryAfter:)`) and OpenCode
+(`OpenCodeProvider.swift:206-210`); `"Flat"` waits `max(60 s, hint)` on every 429 with no doubling —
+Codex (`CodexLocalProvider.swift:161-173`, pinned by its reader), Devin
+(`DevinLocalProvider.swift:64`) and Muse (`MuseLocalProvider.swift:96`). Cursor has no backoff logic
+of its own. Whichever the setting says, the deadline is persisted per reader, so a relaunch cannot
+walk back into the limit.
 
 ## Keys and the host
 

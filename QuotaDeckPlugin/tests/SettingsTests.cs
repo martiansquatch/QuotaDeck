@@ -111,6 +111,37 @@ public class SettingsTests
         Assert.Equal(15, created.StaleAfterMinutes);
     }
 
+    /// <summary>
+    /// The 429 wait is a per-provider setting, written as a name: absent means the ladder (Codenotch's
+    /// Claude/OpenCode behaviour), and a bare number outside the enum is repaired to it too.
+    /// </summary>
+    [Fact]
+    public void TheRateLimitBackoffDefaultsToTheLadderAndRoundTripsByName()
+    {
+        Assert.Equal(RateLimitBackoff.Ladder, new ReaderConfig().RateLimitBackoff);
+
+        var settings = Load("""{ "providers": { "codex": { "rateLimitBackoff": "Flat" } } }""");
+        settings.Normalize();
+        Assert.Equal(RateLimitBackoff.Flat, settings.Providers["codex"].RateLimitBackoff);
+
+        var json = JsonSerializer.Serialize(settings);
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal(
+            "Flat",
+            document.RootElement
+                .GetProperty("providers")
+                .GetProperty("codex")
+                .GetProperty("rateLimitBackoff")
+                .GetString());
+        var roundTrip = Load(json);
+        roundTrip.Normalize();
+        Assert.Equal(RateLimitBackoff.Flat, roundTrip.Providers["codex"].RateLimitBackoff);
+
+        var repaired = new ReaderConfig { RateLimitBackoff = (RateLimitBackoff)7 };
+        repaired.Normalize();
+        Assert.Equal(RateLimitBackoff.Ladder, repaired.RateLimitBackoff);
+    }
+
     private static QuotaDeckSettings Load(string json) =>
         JsonSerializer.Deserialize<QuotaDeckSettings>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
 }

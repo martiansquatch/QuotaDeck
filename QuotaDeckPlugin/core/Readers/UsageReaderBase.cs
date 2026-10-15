@@ -78,6 +78,14 @@ public abstract class UsageReaderBase : IUsageReader
     protected ReaderConfig Config { get; }
 
     /// <summary>
+    /// How this reader waits after a 429: <see cref="ReaderConfig.RateLimitBackoff"/> unless the
+    /// provider's own Swift counterpart pins a different one — Codex waits flat
+    /// (<c>CodexLocalProvider.swift</c>), Claude climbs the ladder — in which case the pinned
+    /// choice wins.
+    /// </summary>
+    protected virtual RateLimitBackoff RateLimitBackoffStyle => this.Config.RateLimitBackoff;
+
+    /// <summary>
     /// How long one fetch gets before this class stops waiting for it.
     ///
     /// Not a cancellation, and it cannot be one: at the bottom of a credential read there may be a
@@ -303,12 +311,16 @@ public abstract class UsageReaderBase : IUsageReader
         if (error.Kind == ReaderErrorKind.RateLimited)
         {
             // The server's hint is honoured only as a floor-raiser: it answers `Retry-After: 0`, and
-            // obeying that literally is what keeps you rate limited. The wait starts at a minute and
-            // doubles for each 429 in a row, and the deadline outlives the process. The count is
+            // obeying that literally is what keeps you rate limited. Which wait follows the hint
+            // depends on the provider's own counterpart: the ladder starts at a minute and doubles
+            // for each 429 in a row (Claude, OpenCode), while Codex, Devin and Muse wait a flat
+            // max(60, hint) every time. The deadline outlives the process either way. The count is
             // raised atomically: two cycles (a scheduled read and a superseding look) may fail here
             // at once, and each must take its own rung of the ladder.
             var attempt = Interlocked.Increment(ref this._consecutiveRateLimits) - 1;
-            var wait = Backoff.Compute(attempt, error.RetryAfter);
+            var wait = this.RateLimitBackoffStyle == RateLimitBackoff.Flat
+                ? Backoff.Flat(error.RetryAfter)
+                : Backoff.Compute(attempt, error.RetryAfter);
             this._store.SaveBackoffUntil(this.Id, now + wait);
         }
 

@@ -132,6 +132,44 @@ public class UsageReaderBaseTests
         Assert.Equal(this._clock.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
     }
 
+    /// <summary>
+    /// The flat choice of Codex, Devin and Muse through the reader: a second 429 waits the same
+    /// max(60 s, hint), never the ladder's second rung.
+    /// </summary>
+    [Fact]
+    public async Task AFlatBackoffWaitsTheHintOnEveryRateLimitWithoutClimbing()
+    {
+        var reader = this.Reader(new ReaderConfig { RateLimitBackoff = RateLimitBackoff.Flat });
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited(TimeSpan.FromSeconds(120)));
+
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(120), this._store.LoadBackoffUntil("test"));
+
+        this._clock.Now = TestData.Now.AddSeconds(121);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(121 + 120), this._store.LoadBackoffUntil("test"));
+
+        // A success still clears it and starts the count over, exactly like the ladder.
+        this._clock.Now = TestData.Now.AddSeconds(121 + 121);
+        reader.OnRead = (_, _) => Task.FromResult(TestData.SessionAndWeekly(0.2, 0.1));
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Null(this._store.LoadBackoffUntil("test"));
+    }
+
+    [Fact]
+    public async Task AFlatBackoffWithoutAHintWaitsTheMinuteOnEveryRateLimit()
+    {
+        var reader = this.Reader(new ReaderConfig { RateLimitBackoff = RateLimitBackoff.Flat });
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited());
+
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+
+        this._clock.Now = TestData.Now.AddSeconds(61);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 60), this._store.LoadBackoffUntil("test"));
+    }
+
     [Fact]
     public async Task WhileHeldOffNoReadIsMadeAndTheReadingAges()
     {
