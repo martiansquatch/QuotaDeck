@@ -170,6 +170,96 @@ public class UsageReaderBaseTests
         Assert.Equal(TestData.Now.AddSeconds(61 + 60), this._store.LoadBackoffUntil("test"));
     }
 
+    /// <summary>
+    /// A flat wait never climbs, so it must not spend the ladder's rungs: a reader that later uses
+    /// the ladder (a style switch here, the config's own reader in the field) starts at 60 s.
+    /// </summary>
+    [Fact]
+    public async Task AFlatWaitDoesNotConsumeTheLaddersRungs()
+    {
+        var reader = this.Reader();
+        reader.StyleOverride = RateLimitBackoff.Flat;
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited());
+
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+
+        this._clock.Now = TestData.Now.AddSeconds(61);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 60), this._store.LoadBackoffUntil("test"));
+
+        // The ladder's first rung is still 60 s, not 4 minutes.
+        reader.StyleOverride = RateLimitBackoff.Ladder;
+        this._clock.Now = TestData.Now.AddSeconds(61 + 61);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(61 + 61 + 60), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>
+    /// OpenCode's ladder caps the whole wait, hint included (OpenCodeProvider.swift:206-211):
+    /// a one-hour hint is fifteen minutes, where the uncapped ladder honours it in full.
+    /// </summary>
+    [Fact]
+    public async Task ACappedLadderBackoffCapsTheHintAtTheCeiling()
+    {
+        var reader = this.Reader(new ReaderConfig { RateLimitBackoff = RateLimitBackoff.LadderCapped });
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited(TimeSpan.FromSeconds(3600)));
+
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(900), this._store.LoadBackoffUntil("test"));
+
+        // And it still climbs: the second 429 doubles (120 s), the hint still capped.
+        this._clock.Now = TestData.Now.AddSeconds(901);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(TestData.Now.AddSeconds(901 + 900), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>
+    /// ReaderManaged skips the base's pre-read check entirely: the reader gets to try its other
+    /// sources while the endpoint is held off, exactly like Codenotch's Claude provider, whose
+    /// hold-off sits inside the keychain step (ClaudeOAuthProvider.swift:303-309).
+    /// </summary>
+    [Fact]
+    public async Task ReaderManagedScopeSkipsTheBaseHoldOffCheck()
+    {
+        this._store.SaveBackoffUntil("test", TestData.Now.AddMinutes(30));
+        var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+        reader.OnRead = (_, _) => throw new ReaderException(ReaderError.RateLimited(TimeSpan.FromMinutes(30)));
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(1, reader.Calls);
+        Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
+        Assert.Equal(TestData.Now.AddMinutes(30), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>
+    /// A ReaderManaged read can see the deadline for itself and apply it to the step that needs it;
+    /// a success still clears it, exactly like a WholeRead reader's.
+    /// </summary>
+    [Fact]
+    public async Task ReaderManagedScopeLetsTheReadApplyTheHoldOffItself()
+    {
+        this._store.SaveBackoffUntil("test", TestData.Now.AddMinutes(30));
+        var reader = this.Reader(holdOffScope: HoldOffScope.ReaderManaged);
+        bool? heldOffInRead = null;
+        DateTimeOffset? deadlineInRead = null;
+        reader.OnRead = (_, _) =>
+        {
+            heldOffInRead = reader.HeldOffNow();
+            deadlineInRead = reader.HoldOffDeadline();
+            return Task.FromResult(TestData.SessionAndWeekly(0.4, 0.2));
+        };
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(1, reader.Calls);
+        Assert.True(heldOffInRead);
+        Assert.Equal(TestData.Now.AddMinutes(30), deadlineInRead);
+        Assert.Equal(ProviderStatusKind.Ok, snapshot.Status.Kind);
+        Assert.Null(this._store.LoadBackoffUntil("test"));
+    }
+
     [Fact]
     public async Task WhileHeldOffNoReadIsMadeAndTheReadingAges()
     {
@@ -483,18 +573,22 @@ public class UsageReaderBaseTests
         Assert.NotNull(this._store.Load("test"));
     }
 
-    private TestReader Reader(ReaderConfig? config = null, TimeSpan? deadline = null) =>
+    private TestReader Reader(
+        ReaderConfig? config = null,
+        TimeSpan? deadline = null,
+        HoldOffScope holdOffScope = HoldOffScope.WholeRead) =>
         new(config ?? new ReaderConfig(), this._store, this._clock)
         {
             FetchDeadline = deadline ?? TimeSpan.FromSeconds(RefreshSchedule.FetchDeadlineSeconds),
+            Scope = holdOffScope,
         };
 
     private sealed class TestReader : UsageReaderBase
     {
+        private readonly TimeProvider _time;
+
         public TestReader(ReaderConfig config, IReaderStateStore store, TimeProvider time)
-            : base(config, store, time)
-        {
-        }
+            : base(config, store, time) => this._time = time;
 
         public override string Id => "test";
 
@@ -504,6 +598,23 @@ public class UsageReaderBaseTests
             (_, _) => Task.FromResult(TestData.SessionAndWeekly(0.5, 0.5));
 
         public int Calls { get; private set; }
+
+        /// <summary>Settable so a test can opt into ReaderManaged, or move between backoff styles.</summary>
+        public HoldOffScope Scope { get; set; } = HoldOffScope.WholeRead;
+
+        /// <summary>Nil means the config's choice; set to pin one like a provider reader does.</summary>
+        public RateLimitBackoff? StyleOverride { get; set; }
+
+        /// <summary>What a ReaderManaged read would see for itself.</summary>
+        public bool HeldOffNow() => this.IsHeldOff(this._time.GetUtcNow());
+
+        /// <summary>The stored deadline, as a ReaderManaged read would read it.</summary>
+        public DateTimeOffset? HoldOffDeadline() => this.HoldOffUntil;
+
+        protected override HoldOffScope HoldOffScope => this.Scope;
+
+        protected override RateLimitBackoff RateLimitBackoffStyle =>
+            this.StyleOverride ?? base.RateLimitBackoffStyle;
 
         protected override Task<ProviderSnapshot> ReadAsync(Freshness freshness, CancellationToken cancellationToken)
         {

@@ -140,6 +140,10 @@ public class SettingsTests
         var repaired = new ReaderConfig { RateLimitBackoff = (RateLimitBackoff)7 };
         repaired.Normalize();
         Assert.Equal(RateLimitBackoff.Ladder, repaired.RateLimitBackoff);
+
+        var capped = Load("""{ "providers": { "opencode": { "rateLimitBackoff": "LadderCapped" } } }""");
+        capped.Normalize();
+        Assert.Equal(RateLimitBackoff.LadderCapped, capped.Providers["opencode"].RateLimitBackoff);
     }
 
     /// <summary>

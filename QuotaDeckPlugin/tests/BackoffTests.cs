@@ -66,6 +66,26 @@ public class BackoffTests
         Assert.Equal(3600d, Backoff.Flat(TimeSpan.FromSeconds(3600)).TotalSeconds);
     }
 
+    /// <summary>
+    /// OpenCode's ladder: the same doubling, but the whole wait — the server's hint included — is
+    /// capped at fifteen minutes (OpenCodeProvider.swift:206-211).
+    /// </summary>
+    [Fact]
+    public void TheCappedLadderCapsTheWholeWaitIncludingTheHint()
+    {
+        Assert.Equal(60d, Backoff.LadderCapped(0).TotalSeconds);
+        Assert.Equal(120d, Backoff.LadderCapped(1).TotalSeconds);
+        Assert.Equal(900d, Backoff.LadderCapped(4).TotalSeconds);
+        Assert.Equal(900d, Backoff.LadderCapped(6).TotalSeconds);
+
+        // The difference from the uncapped ladder is what the hint can do (tested just above):
+        // 300 s still raises the floor, an hour cannot escape the ceiling.
+        Assert.Equal(300d, Backoff.LadderCapped(0, TimeSpan.FromSeconds(300)).TotalSeconds);
+        Assert.Equal(900d, Backoff.LadderCapped(0, TimeSpan.FromSeconds(3600)).TotalSeconds);
+        Assert.Equal(900d, Backoff.LadderCapped(5, TimeSpan.FromSeconds(3600)).TotalSeconds);
+        Assert.Equal(3600d, Backoff.Compute(0, TimeSpan.FromSeconds(3600)).TotalSeconds);
+    }
+
     [Fact]
     public void AholdOffIsRespectedOnlyWhileMoreThanASecondRemains()
     {
