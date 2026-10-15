@@ -51,6 +51,15 @@ public abstract class UsageReaderBase : IUsageReader
     private int _consecutiveRateLimits;
 
     /// <summary>
+    /// Whether this cycle's read asked the source the hold-off covers — set by
+    /// <see cref="MarkRateLimitedSourceConsulted"/> from inside <c>ReadAsync</c>, reset under the
+    /// fetch gate when the cycle starts, and read under the same gate when the outcome is judged.
+    /// A plain field, not an <c>AsyncLocal</c>: a read cycle runs its read exactly once, so one
+    /// field is enough to tell a cache answer from an endpoint one.
+    /// </summary>
+    private bool _rateLimitedSourceConsulted;
+
+    /// <summary>
     /// What the last published result said. A cancellation repeats this instead of inventing a
     /// failure for it; see <see cref="Cancelled"/>. The initial value is Swift's placeholder
     /// default, <c>.stale(since: .distantPast)</c>: a cancellation before any fetch has a truthful
@@ -96,16 +105,26 @@ public abstract class UsageReaderBase : IUsageReader
     /// <summary>
     /// When the stored 429 deadline expires, if one is recorded. For a
     /// <see cref="HoldOffScope.ReaderManaged"/> reader to consult on the steps that are held off;
-    /// the base records and clears it either way.
+    /// the base still owns the deadline — it writes it on a 429 that consulted the source and
+    /// clears it on a consulted success. A method, not a property, because it reads the store.
     /// </summary>
-    protected DateTimeOffset? HoldOffUntil => this._store.LoadBackoffUntil(this.Id);
+    protected DateTimeOffset? LoadHoldOffUntil() => this._store.LoadBackoffUntil(this.Id);
 
     /// <summary>
     /// Whether the stored deadline is still in force at <paramref name="now"/>, with the usual
     /// one-second slack.
     /// </summary>
     protected bool IsHeldOff(DateTimeOffset now) =>
-        this.HoldOffUntil is { } until && Backoff.ShouldHoldOff(until, now);
+        this.LoadHoldOffUntil() is { } until && Backoff.ShouldHoldOff(until, now);
+
+    /// <summary>
+    /// Says that this read actually asked the source the hold-off covers; a
+    /// <see cref="HoldOffScope.ReaderManaged"/> reader calls it immediately before that request.
+    /// The base cannot tell a Desktop-cache answer from an endpoint one, so only a read that
+    /// consulted the source may reset the ladder and clear the deadline on success, or take a rung
+    /// and rewrite the deadline on a 429. Reset at the start of every read cycle.
+    /// </summary>
+    protected void MarkRateLimitedSourceConsulted() => this._rateLimitedSourceConsulted = true;
 
     /// <summary>
     /// How long one fetch gets before this class stops waiting for it.
@@ -173,7 +192,10 @@ public abstract class UsageReaderBase : IUsageReader
                 {
                     // The generation moves under the gate, and Success re-checks it under the same
                     // gate before saving, so two cycles finishing together cannot overwrite the
-                    // newer reading with the older one.
+                    // newer reading with the older one. The consulted flag belongs to this cycle:
+                    // cleared here, set by the read if it asks the held-off source, and read once
+                    // more under this gate when the outcome is judged.
+                    this._rateLimitedSourceConsulted = false;
                     var generation = ++this._generation;
                     cycle = this.RunReadCycle(generation, freshness, cancellationToken);
                     this._inFlight = (cycle, freshness);
@@ -297,8 +319,16 @@ public abstract class UsageReaderBase : IUsageReader
                     ?? this.Degraded(this._lastStatus, returnedAt);
             }
 
-            Interlocked.Exchange(ref this._consecutiveRateLimits, 0);
-            this._store.SaveBackoffUntil(this.Id, null);
+            // A ReaderManaged read that never asked the rate-limited source — a Desktop or CLI
+            // answer, say — is still a fresh reading, so it is stored; but it says nothing about
+            // that source, so the ladder and the deadline are left exactly as they were. A
+            // WholeRead read is every source by definition.
+            if (this.HoldOffScope == HoldOffScope.WholeRead || this._rateLimitedSourceConsulted)
+            {
+                Interlocked.Exchange(ref this._consecutiveRateLimits, 0);
+                this._store.SaveBackoffUntil(this.Id, null);
+            }
+
             this._store.Save(this.Id, new ReaderMemory(published, returnedAt));
             this._lastStatus = published.Status;
             return published;
@@ -335,6 +365,15 @@ public abstract class UsageReaderBase : IUsageReader
     {
         if (error.Kind == ReaderErrorKind.RateLimited)
         {
+            if (this.HoldOffScope == HoldOffScope.ReaderManaged && !this._rateLimitedSourceConsulted)
+            {
+                // A replay, not a new 429: the reader is honouring a hold-off it already has.
+                // Taking a rung or writing the deadline again would ratchet both on every cached
+                // cycle; instead the reading degrades through the normal path — nothing is saved,
+                // and a dimmed reading keeps its own FetchedAt as the Stale since.
+                return this.Degraded(ProviderStatus.Stale(now), now);
+            }
+
             // The server's hint is honoured only as a floor-raiser: it answers `Retry-After: 0`, and
             // obeying that literally is what keeps you rate limited. Which wait follows the hint
             // depends on the provider's own counterpart: the ladder starts at a minute and doubles
