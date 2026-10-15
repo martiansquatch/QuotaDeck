@@ -59,5 +59,5 @@ account.
 - `ShowExtraLimits` is a reader/module property, not a `config.json` setting — core's
   `ReaderConfig` has no per-provider options bag.
 - Reset credits are parsed but not attached to the snapshot (no core field).
-- The plugin host does not consume `IProviderModule` yet, so the key face for Codex waits on that
-  PR.
+- The reader host on `main` discovers `CodexModule` and builds the default-profile reader with the
+  defaults; nothing extra is needed to wire it up.
