@@ -61,6 +61,26 @@ public class ResetCopyTests
     }
 
     /// <summary>
+    /// The days form of the countdown, a QuotaDeck option rather than a Codenotch port: days once
+    /// at least one is left ("5d 23h"), truncated like the hours form, and exactly the same text
+    /// below a day.
+    /// </summary>
+    [Theory]
+    [InlineData(5 * 86400 + 23 * 3600 + 59 * 60, "5d 23h")]
+    [InlineData(3 * 86400, "3d 00h")]
+    [InlineData(24 * 3600, "1d 00h")]
+    [InlineData(26 * 3600, "1d 02h")]
+    [InlineData(23 * 3600 + 59 * 60 + 59, "23h 59m")]
+    [InlineData(2 * 3600 + 5 * 60, "2h 05m")]
+    [InlineData(42, "42s")]
+    [InlineData(0, null)]
+    [InlineData(-5, null)]
+    public void CountdownWithDaysUsesDaysAtADayAndDefersBelowIt(double seconds, string? expected)
+    {
+        Assert.Equal(expected, ResetCopy.CountdownWithDays(At(seconds), Now));
+    }
+
+    /// <summary>
     /// The step is a whole minute above the last one and a whole second inside it, so a ticker can
     /// wake itself on this and redraw nothing early.
     /// </summary>

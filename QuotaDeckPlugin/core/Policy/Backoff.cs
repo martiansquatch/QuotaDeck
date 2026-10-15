@@ -47,6 +47,18 @@ public static class Backoff
         return TimeSpan.FromSeconds(Math.Max(doubled, hint));
     }
 
+    /// <summary>
+    /// <c>max(60, retryAfter ?? 0)</c> seconds, with no ladder: the flat wait Codex, Devin and
+    /// Muse use on every 429 (<c>CodexLocalProvider.swift</c>, <c>DevinLocalProvider.swift:64</c>,
+    /// <c>MuseLocalProvider.swift:96</c>). The floor is the same one the ladder starts from; there
+    /// is no attempt parameter because the wait never climbs.
+    /// </summary>
+    public static TimeSpan Flat(TimeSpan? retryAfter = null)
+    {
+        var hint = retryAfter?.TotalSeconds ?? 0;
+        return TimeSpan.FromSeconds(Math.Max(FloorSeconds, hint));
+    }
+
     /// <summary>True while the deadline is still far enough away to be worth respecting.</summary>
     public static bool ShouldHoldOff(
         DateTimeOffset? until,

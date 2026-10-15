@@ -47,6 +47,36 @@ public class FaceComposerTests
         Assert.Null(passed.Corner);
     }
 
+    /// <summary>
+    /// The corner follows the countdown style: the default is Codenotch's hours form, and the days
+    /// form shortens a multi-day window; below a day the two read the same.
+    /// </summary>
+    [Fact]
+    public void TheCornerCountdownFollowsTheSettingsStyle()
+    {
+        var snapshot = TestData.SessionAndWeekly(0.5, 0.4, sessionResetsAt: TestData.Now.AddHours(71));
+
+        var hours = FaceComposer.Compose(
+            snapshot,
+            new QuotaDeckSettings { CountdownStyle = CountdownStyle.Hours },
+            TestData.Now);
+        Assert.Equal("↻ 71h 00m", hours.Corner);
+
+        var days = FaceComposer.Compose(
+            snapshot,
+            new QuotaDeckSettings { CountdownStyle = CountdownStyle.Days },
+            TestData.Now);
+        Assert.Equal("↻ 2d 23h", days.Corner);
+
+        var soon = TestData.SessionAndWeekly(0.5, 0.4, sessionResetsAt: TestData.Now.AddMinutes(125));
+        Assert.Equal(
+            "↻ 2h 05m",
+            FaceComposer.Compose(soon, new QuotaDeckSettings { CountdownStyle = CountdownStyle.Days }, TestData.Now).Corner);
+        Assert.Equal(
+            "↻ 2h 05m",
+            FaceComposer.Compose(soon, new QuotaDeckSettings { CountdownStyle = CountdownStyle.Hours }, TestData.Now).Corner);
+    }
+
     [Fact]
     public void StaleAndRefusedReadingsAreDimmed()
     {

@@ -49,6 +49,23 @@ public class BackoffTests
         Assert.Equal(60d, Backoff.Compute(0).TotalSeconds);
     }
 
+    /// <summary>
+    /// The flat wait of Codex, Devin and Muse: max(60, hint), the same on every 429 — there is no
+    /// attempt parameter because it never climbs.
+    /// </summary>
+    [Fact]
+    public void TheFlatWaitIsTheFloorOrTheHintWhicheverIsLarger()
+    {
+        Assert.Equal(60d, Backoff.Flat().TotalSeconds);
+        Assert.Equal(60d, Backoff.Flat(TimeSpan.Zero).TotalSeconds);
+        Assert.Equal(60d, Backoff.Flat(TimeSpan.FromSeconds(10)).TotalSeconds);
+        Assert.Equal(120d, Backoff.Flat(TimeSpan.FromSeconds(120)).TotalSeconds);
+        Assert.Equal(300d, Backoff.Flat(TimeSpan.FromSeconds(300)).TotalSeconds);
+
+        // No schedule cap on the hint, same as the ladder: the hint is the server's own answer.
+        Assert.Equal(3600d, Backoff.Flat(TimeSpan.FromSeconds(3600)).TotalSeconds);
+    }
+
     [Fact]
     public void AholdOffIsRespectedOnlyWhileMoreThanASecondRemains()
     {

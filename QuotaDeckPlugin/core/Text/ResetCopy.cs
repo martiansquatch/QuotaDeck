@@ -47,6 +47,35 @@ public static class ResetCopy
     }
 
     /// <summary>
+    /// The countdown with a days unit: "5d 23h" once at least a day is left, otherwise exactly
+    /// <see cref="Countdown"/>. Truncated like it — "5d 23h" is always at least five days and
+    /// twenty-three hours, and "23h 59m" never becomes "1d 00h" early.
+    ///
+    /// Not a Codenotch port: Codenotch's own countdown has no days unit ("72h 00m"), and this is
+    /// the QuotaDeck option (<c>CountdownStyle.Days</c>) for the keypad's narrower corner. The
+    /// default stays Codenotch's form.
+    /// </summary>
+    public static string? CountdownWithDays(DateTimeOffset resetsAt, DateTimeOffset now)
+    {
+        var seconds = (resetsAt - now).TotalSeconds;
+        if (seconds <= 0)
+        {
+            return null;
+        }
+
+        if (seconds < 24 * 3600)
+        {
+            return Countdown(resetsAt, now);
+        }
+
+        var hours = (int)(seconds / 3600);
+        return (hours / 24).ToString(CultureInfo.InvariantCulture)
+            + "d "
+            + (hours % 24).ToString("00", CultureInfo.InvariantCulture)
+            + "h";
+    }
+
+    /// <summary>
     /// When the countdown next reads differently — the next whole second of time left inside the
     /// last minute, the next whole minute above it, or the reset itself. Nil once it has passed.
     ///
