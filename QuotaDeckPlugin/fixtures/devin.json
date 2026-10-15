@@ -1,0 +1,10 @@
+{
+  "id": "devin",
+  "displayName": "Devin",
+  "fidelity": "derived",
+  "status": { "kind": "stale", "since": "2026-10-14T00:00:00+00:00" },
+  "windows": [
+    { "id": "session", "label": "Session limit", "usedFraction": 0.34, "resetsAt": "2027-03-14T00:00:00+00:00" }
+  ],
+  "headlineId": "session"
+}

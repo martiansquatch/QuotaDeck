@@ -61,15 +61,16 @@ namespace Loupedeck.QuotaDeckPlugin
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
         {
             var size = imageSize == PluginImageSize.None ? PluginImageSize.Width90 : imageSize;
+            var face = this.BuildFace();
             if (Panel.Active)
             {
-                var shared = Panel.Tile(this, size, this.BuildFace); // the nine keys as one screen while a scene plays
+                var shared = Panel.Tile(this, size, () => face); // the nine keys as one screen while a scene plays
                 if (shared != null)
                 {
                     return shared;
                 }
             }
-            return FaceRenderer.Draw(size, this.BuildFace(), null, this.GetType().Name);
+            return FaceRenderer.Draw(size, face, face.Overlay, this.GetType().Name);
         }
 
         // The face already carries its label; keep the service from stacking a second one on top.

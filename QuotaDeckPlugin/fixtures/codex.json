@@ -1,0 +1,12 @@
+{
+  "id": "codex",
+  "displayName": "Codex",
+  "fidelity": "official",
+  "status": { "kind": "ok" },
+  "windows": [
+    { "id": "primary", "label": "5-hour limit", "usedFraction": 0.21, "resetsAt": "2027-03-13T18:00:00+00:00", "durationSeconds": 18000 },
+    { "id": "secondary", "label": "Weekly limit", "usedFraction": 0.08, "resetsAt": "2027-03-19T00:00:00+00:00" }
+  ],
+  "headlineId": "primary",
+  "weeklyId": "secondary"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "claude",
+  "displayName": "Claude",
+  "fidelity": "official",
+  "status": { "kind": "ok" },
+  "windows": [
+    { "id": "session", "label": "5-hour limit", "usedFraction": 0.73, "resetsAt": "2027-03-13T15:30:00+00:00", "durationSeconds": 18000 },
+    { "id": "weekly_all", "label": "Weekly limit", "usedFraction": 0.41, "resetsAt": "2027-03-16T00:00:00+00:00" }
+  ],
+  "headlineId": "session",
+  "weeklyId": "weekly_all",
+  "plan": "Max"
+}
