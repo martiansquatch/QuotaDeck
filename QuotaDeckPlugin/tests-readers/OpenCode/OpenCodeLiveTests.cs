@@ -15,8 +15,12 @@ using QuotaDeck.Readers.Tests.Support;
 ///
 /// It asserts only that a Go snapshot with a <c>rolling</c> window came back; the run's report (which
 /// source answered, which window ids) is written to the test output, never to the repository, and
-/// never includes percentages, dates, keys or org ids. It also pins the read-only promise: the store
-/// and its sidecars must have the same size and modification time afterwards.
+/// never includes percentages, dates, keys or org ids. It also pins the observable half of the
+/// read-only promise on a live directory: the fetch adds no file, and <c>auth.json</c> — which the
+/// owner does not rewrite mid-fetch — keeps its size and modification time. The live store's own
+/// <c>-wal</c>/<c>-shm</c> are deliberately not compared that way: the running owner writes them on
+/// its own schedule, so their mtime is not this reader's to control. Modification-freedom itself is
+/// pinned on synthetic stores by <c>OpeningNeverCreatesOrModifiesFiles</c>.
 ///
 /// xunit v2 has no runtime skip, so the un-gated run reports this as passed rather than skipped.
 /// </summary>
@@ -33,11 +37,10 @@ public class OpenCodeLiveTests
 
         var directory = OpenCodeCredentials.ResolveDataDirectory();
         var authPath = Path.Combine(directory, "auth.json");
-        var databasePath = Path.Combine(directory, "opencode.db");
-        var walPath = databasePath + "-wal";
-        var watched = new[] { authPath, databasePath, walPath }.Where(File.Exists).ToArray();
-        Assert.NotEmpty(watched);
-        var before = watched.ToDictionary(path => path, FileState);
+        Assert.True(File.Exists(Path.Combine(directory, "opencode.db")), "no OpenCode store to read");
+
+        var namesBefore = FileNames(directory);
+        var authBefore = FileState(authPath);
 
         var context = new ReaderContext
         {
@@ -59,10 +62,10 @@ public class OpenCodeLiveTests
         Console.WriteLine(
             $"live opencode: source={OriginOf(directory)} windows=[{string.Join(", ", snapshot.Windows.Select(window => window.Id))}]");
 
-        foreach (var path in watched)
-        {
-            Assert.Equal(before[path], FileState(path));
-        }
+        // The read-only promise, observable on a live directory: nothing was added, and the file
+        // the owner leaves alone kept its every byte.
+        Assert.Equal(namesBefore, FileNames(directory));
+        Assert.Equal(authBefore, FileState(authPath));
     }
 
     /// <summary>Which of the three sources the combined loader would claim — labels, never values.</summary>
@@ -81,6 +84,12 @@ public class OpenCodeLiveTests
 
         return OpenCodeCredentials.LoadOAuth(authPath) is not null ? "auth.json (opencode oauth)" : "none";
     }
+
+    private static string[] FileNames(string directory) =>
+        Directory.GetFiles(directory)
+            .Select(Path.GetFileName)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray()!;
 
     private static (DateTime ModifiedUtc, long Length)? FileState(string path) =>
         File.Exists(path) ? (File.GetLastWriteTimeUtc(path), new FileInfo(path).Length) : null;

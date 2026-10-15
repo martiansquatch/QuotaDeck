@@ -9,22 +9,25 @@ using Microsoft.Data.Sqlite;
 ///
 /// Port of Codenotch <c>Sources/Providers/SQLiteStore.swift</c> (<c>open(_:)</c> lines 21-33 and the
 /// two <c>rows(...)</c> readers lines 38-69). OpenCode, Cursor and Devin all keep their state this
-/// way and all run it in WAL mode, which makes opening it more delicate than it looks — that is why
-/// two forms are tried, in order:
+/// way and all run it in WAL mode, which makes opening it more delicate than it looks — and makes a
+/// naive read-only open a writer into the owner's directory:
 /// <list type="bullet">
-/// <item><description><c>mode=ro</c> sees the write-ahead log, so a running app's most recent writes
-/// are visible. But it needs the <c>-shm</c> sidecar to do it, and that file exists only while the
-/// owning app is running: once it has quit and checkpointed, a read-only open can fail outright with
-/// "unable to open database file".</description></item>
-/// <item><description><c>immutable=1</c> tells SQLite to ignore the write-ahead log entirely — a
-/// running app's most recent writes are invisible, and a rotated token looks current. It is only
-/// tried after <c>mode=ro</c> has failed, which is exactly when there is no write-ahead log left to
-/// miss and ignoring it costs nothing.</description></item>
+/// <item><description><c>mode=ro</c> alone still creates the <c>-shm</c> and <c>-wal</c> sidecars on
+/// its first statement when the store has none, so a pure read leaves two new files in another
+/// tool's state directory. Codenotch's identical URI does the same; QuotaDeck's rule is "never
+/// write under another tool's state".</description></item>
+/// <item><description><c>mode=ro&amp;readonly_shm=1</c> sees the write-ahead log — a running app's
+/// most recent writes — while refusing to create the <c>-shm</c> sidecar. But its first statement
+/// still creates a zero-length <c>-wal</c> when the store has none, *before* it fails with
+/// "unable to open database file". So this form is attempted only while both sidecars already exist
+/// on disk (a running writer, or a crash before cleanup): then there is nothing to create and a log
+/// worth reading. With them absent the store is either idle — its main file is the whole truth — or
+/// unreadable, and the attempt is skipped rather than allowed to leave litter.</description></item>
+/// <item><description><c>immutable=1</c> tells SQLite to ignore the write-ahead log entirely, which
+/// is correct exactly when there is none to miss: the idle store's checkpointed state, and the
+/// fallback when the WAL-seeing form cannot serve rows (an unreadable sidecar, say). A running app's
+/// most recent writes are invisible through it, so it is never the first choice.</description></item>
 /// </list>
-/// On SQLite 3.22+ a <c>mode=ro</c> open no longer fails when the <c>-shm</c> sidecar is merely
-/// *absent* — it rebuilds a wal-index in heap memory instead — but a sidecar or log that exists and
-/// cannot be read still fails, as does any other refusal of a read-only open. The fallback carries
-/// those cases, not the quiet one.
 ///
 /// Failure timing is why <see cref="Open"/> probes before handing a connection out: on this SQLite a
 /// read-only WAL open can return success and only report SQLITE_CANTOPEN on the first *statement*.
@@ -49,8 +52,8 @@ using Microsoft.Data.Sqlite;
 public static class SqliteReadOnly
 {
     /// <summary>
-    /// The connection, or null when the file is missing or neither open form works. Callers own the
-    /// connection and must dispose it.
+    /// The connection, or null when the file is missing or no open form works. Callers own the
+    /// connection and must dispose it; opening it never creates or modifies a file next to the store.
     /// </summary>
     public static SqliteConnection? Open(string path)
     {
@@ -61,7 +64,15 @@ public static class SqliteReadOnly
             return null;
         }
 
-        foreach (var query in new[] { "mode=ro", "immutable=1" })
+        var forms = new List<string>(2);
+        if (File.Exists(path + "-wal") && File.Exists(path + "-shm"))
+        {
+            forms.Add("mode=ro&readonly_shm=1");
+        }
+
+        forms.Add("immutable=1");
+
+        foreach (var query in forms)
         {
             SqliteConnection? connection = null;
             try
@@ -71,8 +82,9 @@ public static class SqliteReadOnly
 
                 // A read-only WAL open can succeed and only fail on the *first statement* — the open
                 // call does not touch the write-ahead log, the query does, and SQLITE_CANTOPEN comes
-                // out of step(), not open_v2(). Probing here is what makes "mode=ro first, immutable
-                // second" true: a form that cannot serve rows is rejected before it is handed out.
+                // out of step(), not open_v2(). Probing here is what makes "WAL-seeing form first,
+                // immutable second" true: a form that cannot serve rows is rejected before it is
+                // handed out, instead of surfacing as an empty row set.
                 using var probe = connection.CreateCommand();
                 probe.CommandText = "SELECT count(*) FROM sqlite_master";
                 probe.ExecuteScalar();
@@ -82,7 +94,7 @@ public static class SqliteReadOnly
             catch (SqliteException)
             {
                 // This form is not available for this file; the next one may be. Neither failure is
-                // an error by itself — the caller gets null when both are gone.
+                // an error by itself — the caller gets null when none works.
                 connection?.Dispose();
             }
         }

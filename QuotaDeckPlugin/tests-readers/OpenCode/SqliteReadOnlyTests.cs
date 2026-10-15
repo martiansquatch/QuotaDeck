@@ -97,38 +97,72 @@ public class SqliteReadOnlyTests
     }
 
     /// <summary>
-    /// <c>mode=ro</c> sees writes that are still in the write-ahead log. The fixture is built by
-    /// copying the store mid-write into a second file, so the read happens against fresh inodes
-    /// rather than sharing the writer's in-process state.
+    /// With the owner still running, the WAL-seeing form reads a row committed after the reader
+    /// opened — the write has not been checkpointed into the main file, and it is still the reading
+    /// a face must show. The sidecars were already on disk, so opening and reading add nothing.
     /// </summary>
     [Fact]
-    public void ModeRoSeesTheWriteAheadLog()
+    public void ALiveWritersUncheckpointedRowIsVisible()
     {
-        using var writable = new TempDirectory();
-        using var fixture = new TempDirectory();
+        using var directory = new TempDirectory();
 
-        var (databasePath, keeper) = WritableWalDatabase(writable, "later");
+        // The writer has committed once, so the sidecars exist before the reader arrives.
+        var (databasePath, keeper) = WritableWalDatabase(directory, "later");
         using (keeper)
         {
-            CopyStore(databasePath, fixture.File("opencode.db"), includeShm: false);
+            var before = FileNames(directory);
+
+            using var readOnly = SqliteReadOnly.Open(databasePath);
+            Assert.NotNull(readOnly);
+
+            // Committed after the reader opened, and still only in the write-ahead log.
+            Exec(keeper, "INSERT INTO t VALUES ('after-open')");
+
+            Assert.Equal(
+                ["base", "later", "after-open"],
+                SqliteReadOnly.Column(readOnly, "SELECT x FROM t ORDER BY rowid"));
+            Assert.Equal(before, FileNames(directory));
         }
-
-        using var readOnly = SqliteReadOnly.Open(fixture.File("opencode.db"));
-        Assert.NotNull(readOnly);
-
-        var values = SqliteReadOnly.Column(readOnly, "SELECT x FROM t ORDER BY rowid");
-        Assert.Equal(["base", "later"], values);
     }
 
     /// <summary>
-    /// When <c>mode=ro</c> cannot serve the store, the helper falls back to <c>immutable=1</c>, which
-    /// ignores the write-ahead log — the older, checkpointed reading rather than an error.
+    /// The owner has quit and checkpointed: the directory holds only the store. The helper reads it
+    /// without creating the <c>-shm</c>/<c>-wal</c> sidecars a plain <c>mode=ro</c> open writes into
+    /// the owner's directory on its first statement — the shape the "never write under another
+    /// tool's state" rule exists for.
+    /// </summary>
+    [Fact]
+    public void AnAppQuitStoreIsReadWithoutCreatingSidecars()
+    {
+        using var directory = new TempDirectory();
+        var path = directory.File("opencode.db");
+        using (var setup = Open(path))
+        {
+            Exec(setup, "PRAGMA journal_mode=WAL");
+            Exec(setup, "CREATE TABLE t (x text)");
+            Exec(setup, "INSERT INTO t VALUES ('base')");
+        }
+
+        Assert.Equal(["opencode.db"], FileNames(directory));
+
+        using (var readOnly = SqliteReadOnly.Open(path))
+        {
+            Assert.NotNull(readOnly);
+            Assert.Equal(["base"], SqliteReadOnly.Column(readOnly, "SELECT x FROM t ORDER BY rowid"));
+        }
+
+        Assert.Equal(["opencode.db"], FileNames(directory));
+    }
+
+    /// <summary>
+    /// When the WAL-seeing form cannot serve the store, the helper falls back to
+    /// <c>immutable=1</c>, which ignores the write-ahead log — the older, checkpointed reading
+    /// rather than an error.
     ///
     /// The forcing condition is a write-ahead log that exists but cannot be read; an unreadable
-    /// <c>-shm</c> fails the same way. Merely deleting the sidecar is not enough on the bundled
-    /// SQLite: a read-only open rebuilds the wal-index in heap memory when the sidecar is absent
-    /// (see <see cref="AnAbsentShmIsServedFromHeapMemory"/>), so the fallback's trigger is a
-    /// sidecar or log that is present and unusable rather than a quiet one.
+    /// <c>-shm</c> fails the same way. A store with no sidecars at all skips the WAL-seeing form
+    /// entirely (see <see cref="AnAppQuitStoreIsReadWithoutCreatingSidecars"/>), because the attempt
+    /// itself would leave a zero-length <c>-wal</c> behind.
     /// </summary>
     [Fact]
     public void AnUnreadableWalFallsBackToImmutable()
@@ -146,7 +180,7 @@ public class SqliteReadOnlyTests
         var (databasePath, keeper) = WritableWalDatabase(writable, "later");
         using (keeper)
         {
-            CopyStore(databasePath, fixture.File("opencode.db"), includeShm: true);
+            CopyStore(databasePath, fixture.File("opencode.db"));
         }
 
         using (var readOnly = SqliteReadOnly.Open(fixture.File("opencode.db")))
@@ -174,35 +208,8 @@ public class SqliteReadOnlyTests
     }
 
     /// <summary>
-    /// With the <c>-shm</c> sidecar absent — the state after the owning app quit — <c>mode=ro</c>
-    /// still reads the write-ahead log, from a wal-index rebuilt in heap memory. Pinned because the
-    /// Swift comment (written against the system SQLite) says the opposite: the fallback in
-    /// <c>SQLiteStore.open</c> is still worth having, but on the bundled SQLite it is not what makes
-    /// an app-quit store readable.
-    /// </summary>
-    [Fact]
-    public void AnAbsentShmIsServedFromHeapMemory()
-    {
-        using var writable = new TempDirectory();
-        using var fixture = new TempDirectory();
-
-        var (databasePath, keeper) = WritableWalDatabase(writable, "later");
-        using (keeper)
-        {
-            // No -shm copy: only the store and its log make the trip.
-            CopyStore(databasePath, fixture.File("opencode.db"), includeShm: false);
-        }
-
-        Assert.False(File.Exists(fixture.File("opencode.db-shm")));
-
-        using var readOnly = SqliteReadOnly.Open(fixture.File("opencode.db"));
-        Assert.NotNull(readOnly);
-        Assert.Equal(["base", "later"], SqliteReadOnly.Column(readOnly, "SELECT x FROM t ORDER BY rowid"));
-    }
-
-    /// <summary>
     /// Opening and reading never writes: the store, its log and its sidecar keep their size and
-    /// modification time, and no rollback journal appears beside them.
+    /// modification time, and no file is added beside them.
     /// </summary>
     [Fact]
     public void OpeningNeverCreatesOrModifiesFiles()
@@ -211,6 +218,7 @@ public class SqliteReadOnlyTests
         var (databasePath, keeper) = WritableWalDatabase(writable, "later");
         using (keeper)
         {
+            var beforeNames = FileNames(writable);
             var watched = new[] { databasePath, databasePath + "-wal", databasePath + "-shm" }
                 .Where(File.Exists)
                 .Select(path => (Path: path, Length: new FileInfo(path).Length, Modified: File.GetLastWriteTimeUtc(path)))
@@ -229,8 +237,8 @@ public class SqliteReadOnlyTests
                 Assert.Equal(modified, File.GetLastWriteTimeUtc(path));
             }
 
+            Assert.Equal(beforeNames, FileNames(writable));
             Assert.Empty(Directory.GetFiles(writable.Path, "*-journal"));
-            Assert.Empty(Directory.GetFiles(writable.Path, "*-mj*"));
         }
     }
 
@@ -284,7 +292,7 @@ public class SqliteReadOnlyTests
     /// <summary>
     /// A store with one checkpointed row and one write-ahead-log row, the writer still open.
     /// </summary>
-    private static (string Path, IDisposable Keeper) WritableWalDatabase(TempDirectory directory, params string[] logRows)
+    private static (string Path, SqliteConnection Keeper) WritableWalDatabase(TempDirectory directory, params string[] logRows)
     {
         var path = directory.File("writable.db");
         using (var setup = Open(path))
@@ -306,13 +314,20 @@ public class SqliteReadOnlyTests
         return (path, keeper);
     }
 
-    private static void CopyStore(string source, string destination, bool includeShm)
+    private static void CopyStore(string source, string destination)
     {
         File.Copy(source, destination);
         File.Copy(source + "-wal", destination + "-wal");
-        if (includeShm && File.Exists(source + "-shm"))
+        if (File.Exists(source + "-shm"))
         {
             File.Copy(source + "-shm", destination + "-shm");
         }
     }
+
+    /// <summary>The directory's file names, sorted: what a read must leave exactly as it found it.</summary>
+    private static string[] FileNames(TempDirectory directory) =>
+        Directory.GetFiles(directory.Path)
+            .Select(System.IO.Path.GetFileName)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray()!;
 }

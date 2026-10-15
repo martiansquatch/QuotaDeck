@@ -102,6 +102,22 @@ public class OpenCodeCredentialsTests
         Assert.Equal(1_792_877_970.039, credential!.Expires!.Value.ToUnixTimeMilliseconds() / 1000.0, precision: 3);
     }
 
+    /// <summary>
+    /// An absurd but finite expiry reads as far-future, like Swift's <c>Date</c> — not missing, and
+    /// never a throw that would turn the fetch into an Error status.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"type":"oauth","access":"st_abc","expires":1e300}""")]
+    [InlineData("""{"type":"oauth","access":"st_abc","expires":"1e300"}""")]
+    public void AnAbsurdExpiryIsFarFutureRatherThanMissingOrThrowing(string json)
+    {
+        using var entry = JsonDocument.Parse(json);
+
+        var credential = OpenCodeCredentials.FromEntry(entry.RootElement, OpenCodeCredentials.SourceName);
+
+        Assert.Equal(DateTimeOffset.MaxValue, credential!.Expires);
+    }
+
     /// <summary>An OAuth entry with no access token is not a credential.</summary>
     [Fact]
     public void AnOAuthEntryWithoutATokenIsMissing()
@@ -248,16 +264,37 @@ public class OpenCodeCredentialsTests
         Assert.True(credential!.OAuth);
     }
 
-    /// <summary>A stored value that is a bare JSON string is the key itself, and it parses.</summary>
+    /// <summary>
+    /// A database row that is a bare JSON string is skipped: <c>JSONSerialization</c> without
+    /// <c>.fragmentsAllowed</c> refuses a fragment root, so Swift's database reader never sees that
+    /// shape, and neither does this one. The bare-string value remains valid in <c>auth.json</c>,
+    /// where the entry arrives already parsed — see <see cref="ReadsABareStringEntry"/>.
+    /// </summary>
     [Fact]
-    public void TheDatabaseReadsABareStringValue()
+    public void TheDatabaseSkipsABareStringRow()
     {
         using var directory = new TempDirectory();
         var database = OpenCodeTestReader.CreateCredentialDatabase(
             directory,
             ("opencode-go", "\"sk-bare\"", null, 1));
 
-        Assert.Equal("sk-bare", OpenCodeCredentials.LoadFromDatabase(database)?.Token);
+        Assert.Null(OpenCodeCredentials.LoadFromDatabase(database));
+    }
+
+    /// <summary>
+    /// The skip order that matters: a bare-string <c>opencode-go</c> row that is newer must not
+    /// shadow an older object row — Swift skips the fragment and claims <c>sk-new</c>.
+    /// </summary>
+    [Fact]
+    public void TheDatabaseSkipsABareStringRowInFavourOfAnOlderObjectRow()
+    {
+        using var directory = new TempDirectory();
+        var database = OpenCodeTestReader.CreateCredentialDatabase(
+            directory,
+            ("opencode-go", "\"sk-old\"", null, 9),
+            ("opencode-go", """{"type":"api","key":"sk-new"}""", null, 1));
+
+        Assert.Equal("sk-new", OpenCodeCredentials.LoadFromDatabase(database)?.Token);
     }
 
     // ---- Presence. ----

@@ -38,12 +38,15 @@ public static class OpenCodeCredentials
     public const string SourceName = "OpenCode";
 
     /// <summary>
-    /// Where the "SQLite native library is missing" fallback gets said out loud. Console.Error by
-    /// default; the host may replace it. QuotaDeck core exposes no logging seam a readers-project
-    /// class can reach (noted as a gap in the PR that added this file).
+    /// Where the "SQLite native library is missing" fallback gets said out loud — once per process,
+    /// because every fetch would otherwise repeat it. Console.Error by default; the host may replace
+    /// it. QuotaDeck core exposes no logging seam a readers-project class can reach (noted as a gap
+    /// in the PR that added this file).
     /// </summary>
     public static Action<string>? Warning { get; set; } =
         message => Console.Error.WriteLine($"opencode: {message}");
+
+    private static int _nativeLibraryWarningSent;
 
     /// <summary>
     /// One stored credential value, in any of the shapes OpenCode has written.
@@ -160,7 +163,12 @@ public static class OpenCodeCredentials
             // The plugin's flattened bin layout can leave the NuGet runtimes/ folder behind; the
             // native library then fails to load. That is not a credential answer — fall through to
             // the auth.json sources instead of failing the fetch, and say so somewhere visible.
-            Warning?.Invoke("SQLite native library unavailable; reading credentials from auth.json only");
+            // Once per process: the condition is a property of the host, not of the fetch.
+            if (Interlocked.Exchange(ref _nativeLibraryWarningSent, 1) == 0)
+            {
+                Warning?.Invoke("SQLite native library unavailable; reading credentials from auth.json only");
+            }
+
             return null;
         }
 
@@ -207,6 +215,16 @@ public static class OpenCodeCredentials
 
                     using (value)
                     {
+                        // JSONSerialization.jsonObject(with:) without .fragmentsAllowed refuses a
+                        // bare string (or number), so Swift's database reader skips a row like
+                        // `"sk-old"` and tries the next one. The bare-string shape survives only in
+                        // auth.json, where the value arrives already parsed — see FromEntry. Arrays
+                        // parse there but produce no credential either, so both are skipped here.
+                        if (value.RootElement.ValueKind != JsonValueKind.Object)
+                        {
+                            continue;
+                        }
+
                         if (FromEntry(value.RootElement, SourceName) is { } found)
                         {
                             return found;
@@ -223,6 +241,10 @@ public static class OpenCodeCredentials
     /// One stored credential value, in any of the shapes OpenCode has written: a bare string,
     /// <c>{"type":"api","key":…}</c>, or
     /// <c>{"type":"oauth","access":…,"expires":…,"metadata":{"orgID","server"}}</c>.
+    ///
+    /// Port of the Swift <c>credential(from:source:)</c>, which both auth.json sources feed
+    /// directly. Database values arrive through <see cref="LoadFromDatabase"/>, which rejects the
+    /// fragment shapes <c>JSONSerialization</c> refuses before calling this.
     /// </summary>
     public static Credential? FromEntry(JsonElement entry, string source)
     {
@@ -323,8 +345,27 @@ public static class OpenCodeCredentials
         };
 
         return number is { } milliseconds && double.IsFinite(milliseconds) && milliseconds > 0
-            ? DateTimeOffset.UnixEpoch.AddMilliseconds(milliseconds)
+            ? FromEpochMilliseconds(milliseconds)
             : null;
+    }
+
+    /// <summary>
+    /// Swift's <c>Date(timeIntervalSince1970:)</c> holds arbitrarily large intervals and simply
+    /// compares as far-future; the field's only use is an expiry test, so an interval beyond
+    /// <see cref="DateTimeOffset.MaxValue"/> reads as MaxValue — far-future — rather than throwing
+    /// the way a bare <c>AddMilliseconds</c> would. (Missing stays missing: only non-finite and
+    /// non-positive values are dropped.)
+    /// </summary>
+    private static DateTimeOffset FromEpochMilliseconds(double milliseconds)
+    {
+        try
+        {
+            return DateTimeOffset.UnixEpoch.AddMilliseconds(milliseconds);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return DateTimeOffset.MaxValue;
+        }
     }
 
     /// <summary>
