@@ -1,6 +1,7 @@
 namespace QuotaDeck.Readers.Tests.Codex;
 
 using System.Net;
+using System.Text;
 using QuotaDeck.Core.Model;
 using QuotaDeck.Core.Policy;
 using QuotaDeck.Core.Readers;
@@ -133,6 +134,31 @@ public class CodexReaderTests
         Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
         Assert.Equal(Now.AddSeconds(60), store.LoadBackoffUntil("codex"));
         Assert.Single(transport.Requests);
+    }
+
+    /// <summary>
+    /// Codex waits flat (CodexLocalProvider.swift:161-173): a second 429 in a row is another
+    /// minute, never the ladder's two.
+    /// </summary>
+    [Fact]
+    public async Task ConsecutiveRateLimitsStayFlatOnCodex()
+    {
+        using var home = new CodexTestHome();
+        CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
+
+        var transport = new FakeTransport();
+        transport.Respond(UsageUrl, HttpStatusCode.TooManyRequests);
+        transport.Respond(UsageUrl, HttpStatusCode.TooManyRequests);
+        var store = new InMemoryReaderStateStore();
+        var clock = new FakeClock(Now);
+        var reader = Reader(home.Root, transport, store, clock);
+
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(Now.AddSeconds(60), store.LoadBackoffUntil("codex"));
+
+        clock.Advance(61);
+        await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(Now.AddSeconds(61 + 60), store.LoadBackoffUntil("codex"));
     }
 
     [Fact]
@@ -386,6 +412,59 @@ public class CodexReaderTests
         Assert.Single(transport.Requests);
     }
 
+    /// <summary>
+    /// The hint is measured when the 429 arrives, not when the request was built
+    /// (CodexLocalProvider.swift:64): a slow exchange must not stretch an HTTP-date wait.
+    /// </summary>
+    [Fact]
+    public async Task AnHttpDateRetryAfterIsMeasuredWhenThe429Arrives()
+    {
+        using var home = new CodexTestHome();
+        CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
+
+        var clock = new FakeClock(Now);
+        var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+        {
+            Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+        };
+        response.Headers.TryAddWithoutValidation("Retry-After", Now.AddSeconds(300).UtcDateTime.ToString("r"));
+        var transport = new InFlightClockTransport(clock, TimeSpan.FromSeconds(60), response);
+        var store = new InMemoryReaderStateStore();
+        var reader = Reader(home.Root, transport, store, clock);
+
+        await reader.FetchAsync(Freshness.Standard);
+
+        // Requested at Now, the 429 arrives at Now+60, the hint points at Now+300 ⇒ a 240 s wait,
+        // so the deadline is Now+300. Measuring the hint at the request would give Now+360.
+        Assert.Equal(Now.AddSeconds(300), store.LoadBackoffUntil("codex"));
+    }
+
+    /// <summary>
+    /// The concurrent reset-credits fetch is awaited even when the usage parse throws — here a body
+    /// with no windows — so it is never left unobserved.
+    /// </summary>
+    [Fact]
+    public async Task TheResetCreditsFetchIsAwaitedEvenWhenTheUsageParseThrows()
+    {
+        using var home = new CodexTestHome();
+        CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transport = new GatedResetCreditsTransport(gate);
+        var reader = Reader(home.Root, transport, new InMemoryReaderStateStore(), new FakeClock(Now));
+
+        var fetch = reader.FetchAsync(Freshness.Standard);
+        await transport.CreditsReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The usage body has already thrown nothingMetered; the cycle is still holding the credits
+        // fetch, so it cannot return before the gate opens.
+        Assert.False(fetch.IsCompleted);
+
+        gate.SetResult();
+        var snapshot = await fetch;
+        Assert.Equal(ProviderStatusKind.Unsupported, snapshot.Status.Kind);
+    }
+
     private static CodexReader Reader(
         string home,
         IHttpTransport transport,
@@ -406,4 +485,57 @@ public class CodexReaderTests
             Http = transport,
             Process = new FakeProcessRunner(),
         };
+
+    /// <summary>A transport that moves the clock while the request is in flight, then answers.</summary>
+    private sealed class InFlightClockTransport : IHttpTransport
+    {
+        private readonly FakeClock _clock;
+        private readonly TimeSpan _advance;
+        private readonly HttpResponseMessage _response;
+
+        public InFlightClockTransport(FakeClock clock, TimeSpan advance, HttpResponseMessage response)
+        {
+            this._clock = clock;
+            this._advance = advance;
+            this._response = response;
+        }
+
+        public Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            this._clock.Advance(this._advance);
+            return Task.FromResult(this._response);
+        }
+    }
+
+    /// <summary>A transport whose reset-credits answer waits for the test to open the gate; usage
+    /// answers immediately with an empty body.</summary>
+    private sealed class GatedResetCreditsTransport : IHttpTransport
+    {
+        private readonly TaskCompletionSource _gate;
+
+        public GatedResetCreditsTransport(TaskCompletionSource gate) => this._gate = gate;
+
+        public TaskCompletionSource CreditsReached { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("rate-limit-reset-credits", StringComparison.Ordinal))
+            {
+                this.CreditsReached.SetResult();
+                await this._gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+            };
+        }
+    }
 }

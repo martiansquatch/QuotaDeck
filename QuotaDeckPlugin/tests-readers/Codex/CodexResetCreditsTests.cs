@@ -151,4 +151,26 @@ public class CodexResetCreditsTests
         Assert.Equal(0, Credits("{}").AvailableCount);
         Assert.Empty(Credits("[]").Credits);
     }
+
+    /// <summary>
+    /// Swift's <c>ISO8601DateFormatter</c> with <c>.withInternetDateTime</c> rejects a stamp with no
+    /// zone designator — "2026-07-12T01:33:14" is nil, not local time — so that credit has no
+    /// expiry. An offset is a zone designator and still parses.
+    /// </summary>
+    [Fact]
+    public void AZoneLessExpiryIsNoExpiryLikeSwiftsInternetDateFormatter()
+    {
+        var result = Credits("""
+        {"credits":[
+          {"id":"zoneless","status":"available","expires_at":"2026-07-12T01:33:14"},
+          {"id":"zoned","status":"available","expires_at":"2026-07-12T01:33:14Z"},
+          {"id":"offset","status":"available","expires_at":"2026-07-12T01:33:14+02:00"}
+        ]}
+        """);
+
+        Assert.Null(result.Credits[0].ExpiresAt);
+        Assert.Equal(Utc(2026, 7, 12, 1, 33, 14), result.Credits[1].ExpiresAt);
+        Assert.Equal(Utc(2026, 7, 11, 23, 33, 14), result.Credits[2].ExpiresAt);
+        Assert.Equal(Utc(2026, 7, 11, 23, 33, 14), result.NextExpiry);
+    }
 }

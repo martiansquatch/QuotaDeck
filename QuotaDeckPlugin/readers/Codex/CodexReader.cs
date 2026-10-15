@@ -3,6 +3,7 @@ namespace QuotaDeck.Readers.Codex;
 using QuotaDeck.Core.Model;
 using QuotaDeck.Core.Policy;
 using QuotaDeck.Core.Readers;
+using QuotaDeck.Core.Settings;
 
 /// <summary>
 /// Reads live account limits using the session owned and refreshed by Codex.
@@ -54,6 +55,12 @@ public sealed class CodexReader : UsageReaderBase
     public override string DisplayName => "Codex";
 
     /// <summary>
+    /// Codex waits a flat <c>max(60 s, hint)</c> after every 429, never the doubling ladder
+    /// (CodexLocalProvider.swift:161-173 and the sixty-second floor in the 429 branch at line 65).
+    /// </summary>
+    protected override RateLimitBackoff RateLimitBackoffStyle => RateLimitBackoff.Flat;
+
+    /// <summary>
     /// Whether the extra Spark / code-review windows are read.
     ///
     /// Port of <c>Preferences.storedShowCodexExtraLimits()</c>
@@ -88,8 +95,12 @@ public sealed class CodexReader : UsageReaderBase
 
         if (status == 429)
         {
+            // The hint is a deadline measured when the 429 arrives — `let receivedAt = Date()` in
+            // CodexLocalProvider.swift:64 — not when the request was built, so a slow exchange
+            // cannot stretch the wait past the server's own date.
+            var receivedAt = this._context.TimeProvider.GetUtcNow();
             var delay = TimeSpan.FromSeconds(
-                Math.Max(RateLimitFloorSeconds, this.RetryAfterSeconds(usageResponse, now) ?? 0));
+                Math.Max(RateLimitFloorSeconds, this.RetryAfterSeconds(usageResponse, receivedAt) ?? 0));
             throw new ReaderException(ReaderError.RateLimited(delay));
         }
 
@@ -106,32 +117,36 @@ public sealed class CodexReader : UsageReaderBase
         // that fetch before parsing extras so a slow or empty extras payload cannot skip the
         // credits row (CodexLocalProvider.swift:74-77).
         var resetCredits = this.FetchResetCreditsAsync(credential, cancellationToken);
-
-        var windows = CodexUsage.Windows(body, now, this.ShowExtraLimits);
-        var account = CodexCredentials.Account(this._profile.AuthPath);
-        var plan = CodexUsage.Plan(body) ?? NonEmpty(account?.Plan);
-
-        // core's ProviderSnapshot has no reset-credits field, so the parsed value is dropped here;
-        // the fetch still runs concurrently, exactly like Codenotch's, so the read path — and its
-        // failures being ignored — stays the same. See the PR for the gap.
-        _ = await resetCredits.ConfigureAwait(false);
-
-        return new ProviderSnapshot
+        try
         {
-            Id = this.Id,
-            DisplayName = this.DisplayName,
-            Fidelity = Fidelity.Official,
-            Status = ProviderStatus.Ok,
-            Windows = windows,
+            var windows = CodexUsage.Windows(body, now, this.ShowExtraLimits);
+            var account = CodexCredentials.Account(this._profile.AuthPath);
+            var plan = CodexUsage.Plan(body) ?? NonEmpty(account?.Plan);
 
-            // Named, not positional (CodexLocalProvider.swift:97-99).
-            HeadlineId = "primary",
-            WeeklyId = "secondary",
-            Plan = plan,
+            return new ProviderSnapshot
+            {
+                Id = this.Id,
+                DisplayName = this.DisplayName,
+                Fidelity = Fidelity.Official,
+                Status = ProviderStatus.Ok,
+                Windows = windows,
 
-            // The email claim is personal data: it is used only as this label, never logged.
-            AccountLabel = account?.Label,
-        };
+                // Named, not positional (CodexLocalProvider.swift:97-99).
+                HeadlineId = "primary",
+                WeeklyId = "secondary",
+                Plan = plan,
+
+                // The email claim is personal data: it is used only as this label, never logged.
+                AccountLabel = account?.Label,
+            };
+        }
+        finally
+        {
+            // Awaited even when the usage parse throws — nothing metered, an unreadable body — so
+            // the concurrent fetch is never left unobserved. Its value is dropped: core's
+            // ProviderSnapshot has no reset-credits field yet. See the PR for the gap.
+            _ = await resetCredits.ConfigureAwait(false);
+        }
     }
 
     /// <summary>

@@ -305,10 +305,17 @@ public static class CodexUsage
 
     /// <summary>
     /// The backend mixes whole-second and fractional ISO-8601 stamps; each formatter rejects the
-    /// other form (CodexUsage.swift:388-395).
+    /// other form (CodexUsage.swift:388-395). A stamp without a zone designator is nil, exactly as
+    /// <c>ISO8601DateFormatter</c>'s <c>.withInternetDateTime</c> rejects it — it is not local
+    /// time.
     /// </summary>
     private static DateTimeOffset? ParseIso8601(string text)
     {
+        if (!HasZoneDesignator(text))
+        {
+            return null;
+        }
+
         foreach (var format in Iso8601Formats)
         {
             if (DateTimeOffset.TryParseExact(
@@ -323,5 +330,29 @@ public static class CodexUsage
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Whether the stamp carries a zone: a 'Z', or a '+'/'-' offset after the seconds. Everything
+    /// before position 19 is the date itself, where '-' is a separator; a fraction contains digits
+    /// and a dot only.
+    /// </summary>
+    private static bool HasZoneDesignator(string text)
+    {
+        const int afterSeconds = 19; // "yyyy-MM-ddTHH:mm:ss"
+        if (text.Length <= afterSeconds)
+        {
+            return false;
+        }
+
+        foreach (var character in text.AsSpan(afterSeconds))
+        {
+            if (character is 'Z' or '+' or '-')
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
