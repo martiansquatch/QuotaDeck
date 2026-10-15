@@ -240,6 +240,24 @@ public class OpenCodeReaderTests
 
     // ---- The other statuses. ----
 
+    /// <summary>
+    /// A network error is not translated: it surfaces as whatever the transport threw, and the base
+    /// maps it to an Error status carrying its message.
+    /// </summary>
+    [Fact]
+    public async Task ANetworkErrorSurfacesAsAnErrorStatus()
+    {
+        using var directory = DirectoryWithGoKey();
+        var transport = new ScriptedTransport();
+        transport.Throw(new HttpRequestException("boom"));
+        var reader = new OpenCodeReader(ContextWith(transport), directory.Path);
+
+        var snapshot = await reader.FetchAsync(Freshness.FromSource);
+
+        Assert.Equal(ProviderStatusKind.Error, snapshot.Status.Kind);
+        Assert.Equal("boom", snapshot.Status.Message);
+    }
+
     [Fact]
     public async Task A403IsNothingMeteredForKey()
     {

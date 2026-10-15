@@ -156,6 +156,9 @@ internal sealed class ScriptedTransport : IHttpTransport
             return message;
         });
 
+    /// <summary>The next request fails the way a dead network does, rather than answering.</summary>
+    public void Throw(Exception exception) => this._queue.Enqueue(() => throw exception);
+
     public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, TimeSpan timeout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);

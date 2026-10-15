@@ -24,7 +24,7 @@ using QuotaDeck.Core.Readers.Services;
 /// order: it runs before the token's own expiry hint, so an expired sign-in whose console still
 /// answers 200 is "no Go plan", not "credential expired".
 /// </summary>
-internal static class OpenCodeProvider
+public static class OpenCodeProvider
 {
     private const double TimeoutSeconds = 15;
 
