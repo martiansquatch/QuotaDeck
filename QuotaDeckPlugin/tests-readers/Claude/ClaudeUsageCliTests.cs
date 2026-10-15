@@ -351,7 +351,7 @@ public class ClaudeUsageCliTests
     }
 
     [Fact]
-    public void RunningItUsesTheScratchDirectoryAndAPrintModeCommandLine()
+    public async Task RunningItUsesTheScratchDirectoryAndAPrintModeCommandLine()
     {
         var files = new FakeClaudeFileSystem();
         var process = new QuotaDeck.Readers.Tests.Support.FakeProcessRunner();
@@ -359,8 +359,8 @@ public class ClaudeUsageCliTests
         process.Respond(binary, 0, "Current session: 1% used · resets Sep 7 at 3pm (UTC)\n");
         var cli = new ClaudeUsageCli(binary, "/tmp/quotadeck-claude-data", process, files);
 
-        var reading = cli.ReadWithPlanAsync(
-            ClaudeProfile.Default("/tmp/quotadeck-claude-home", files), Now, CancellationToken.None).GetAwaiter().GetResult();
+        var reading = await cli.ReadWithPlanAsync(
+            ClaudeProfile.Default("/tmp/quotadeck-claude-home", files), Now, CancellationToken.None);
 
         var request = Assert.Single(process.Requests);
         Assert.Equal(binary, request.FileName);
@@ -377,7 +377,7 @@ public class ClaudeUsageCliTests
     }
 
     [Fact]
-    public void ANamedProfileCarriesItsConfigDirectory()
+    public async Task ANamedProfileCarriesItsConfigDirectory()
     {
         var files = new FakeClaudeFileSystem();
         var process = new QuotaDeck.Readers.Tests.Support.FakeProcessRunner();
@@ -386,7 +386,7 @@ public class ClaudeUsageCliTests
         var cli = new ClaudeUsageCli(binary, "/tmp/quotadeck-claude-data", process, files);
         var profile = new ClaudeProfile("work", "/tmp/quotadeck-claude-home/.claude-work", files, "testaccount");
 
-        _ = cli.ReadWithPlanAsync(profile, Now, CancellationToken.None).GetAwaiter().GetResult();
+        _ = await cli.ReadWithPlanAsync(profile, Now, CancellationToken.None);
 
         Assert.Equal(
             "/tmp/quotadeck-claude-home/.claude-work",
@@ -394,7 +394,7 @@ public class ClaudeUsageCliTests
     }
 
     [Fact]
-    public void ANonZeroExitIsNeedsAuth()
+    public async Task ANonZeroExitIsNeedsAuth()
     {
         var files = new FakeClaudeFileSystem();
         var process = new QuotaDeck.Readers.Tests.Support.FakeProcessRunner();
@@ -402,14 +402,13 @@ public class ClaudeUsageCliTests
         process.Respond(binary, 1, string.Empty);
         var cli = new ClaudeUsageCli(binary, "/tmp/quotadeck-claude-data", process, files);
 
-        var error = Assert.Throws<ReaderException>(() => cli
-            .ReadWithPlanAsync(ClaudeProfile.Default("/tmp/quotadeck-claude-home", files), Now, CancellationToken.None)
-            .GetAwaiter().GetResult());
+        var error = await Assert.ThrowsAsync<ReaderException>(() => cli
+            .ReadWithPlanAsync(ClaudeProfile.Default("/tmp/quotadeck-claude-home", files), Now, CancellationToken.None));
         Assert.Equal(ReaderErrorKind.NeedsAuth, error.Error.Kind);
     }
 
     [Fact]
-    public void AnEmptyAnswerIsBadResponse()
+    public async Task AnEmptyAnswerIsBadResponse()
     {
         var files = new FakeClaudeFileSystem();
         var process = new QuotaDeck.Readers.Tests.Support.FakeProcessRunner();
@@ -417,9 +416,8 @@ public class ClaudeUsageCliTests
         process.Respond(binary, 0, string.Empty);
         var cli = new ClaudeUsageCli(binary, "/tmp/quotadeck-claude-data", process, files);
 
-        var error = Assert.Throws<ReaderException>(() => cli
-            .ReadWithPlanAsync(ClaudeProfile.Default("/tmp/quotadeck-claude-home", files), Now, CancellationToken.None)
-            .GetAwaiter().GetResult());
+        var error = await Assert.ThrowsAsync<ReaderException>(() => cli
+            .ReadWithPlanAsync(ClaudeProfile.Default("/tmp/quotadeck-claude-home", files), Now, CancellationToken.None));
         Assert.Equal(ReaderErrorKind.BadResponse, error.Error.Kind);
     }
 }

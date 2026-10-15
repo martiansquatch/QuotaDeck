@@ -23,10 +23,13 @@ carried.
 The endpoint's 429 hold-off is the reader's own to apply: `ClaudeReader` takes
 `HoldOffScope.ReaderManaged`, so a penalty stands for the usage endpoint alone and the Desktop cache
 and `claude /usage` still get their turn — Codenotch checks `retryNoEarlierThan` inside the keychain
-step (`ClaudeOAuthProvider.swift:303-309`), after both. While the penalty stands, a read that did not
-ask the endpoint keeps it in place (`EndpointHoldOffStore`, because the base clears the deadline on
-every success and a cache or CLI answer says nothing about the endpoint's rate limit), and a read
-with nothing else to show hands back the last reading, aged, without spending a request. The token
-renewal is one atomic claim (`ClaudeTokenRefresher.TryClaim`): two fetches finishing together cannot
-launch two `claude -p` processes for one expiry, and the renewal runs on its own task *after* the
-reading, so a slow `claude` start never spends the fetch's deadline.
+step (`ClaudeOAuthProvider.swift:303-309`), after both. The reader honours the contract that scope
+comes with: while the penalty stands it throws `ReaderError.RateLimited(remaining)` *without*
+calling `MarkRateLimitedSourceConsulted()`, and the base reads an unmarked throw as the replay it is
+— no ladder rung, no deadline write, and the last reading degrades to Stale dated from when it was
+actually taken. Immediately before a request it does make, it marks the source consulted, so a real
+429 takes its rung and rewrites the deadline and a real success clears both. A cache or CLI answer
+is never marked, so it leaves the endpoint's penalty and the ladder exactly where they were. The
+token renewal is one atomic claim (`ClaudeTokenRefresher.TryClaim`): two fetches finishing together
+cannot launch two `claude -p` processes for one expiry, and the renewal runs on its own task *after*
+the reading, so a slow `claude` start never spends the fetch's deadline.

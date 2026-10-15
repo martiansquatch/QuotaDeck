@@ -110,9 +110,10 @@ public sealed class ClaudeTokenRefresher
     /// The overlap guard, as one atomic claim: the first caller to move the flag from 0 to 1 wins,
     /// everyone else is told to leave. A check-then-set pair would leave a window — narrow, but a
     /// real one when two fetches finish together on two threads — in which both callers see 0 and
-    /// both launch a process for the same expiry.
+    /// both launch a process for the same expiry. Internal, because it is an implementation detail:
+    /// the test assembly is its one friend (see ClaudeInternals.cs).
     /// </summary>
-    public static bool TryClaim(ref int flag) => Interlocked.CompareExchange(ref flag, 1, 0) == 0;
+    internal static bool TryClaim(ref int flag) => Interlocked.CompareExchange(ref flag, 1, 0) == 0;
 
     /// <summary>
     /// Whether a launch is worth making. Pure, so every branch is testable without a clock, a
