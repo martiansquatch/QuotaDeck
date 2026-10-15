@@ -30,8 +30,11 @@ public sealed class HttpClientTransport : IHttpTransport
 
     /// <summary>
     /// A transport over a caller-supplied handler, for tests that need to script what the network
-    /// does — headers first, then a body that stalls. The production constructor stays the one
-    /// above.
+    /// does — headers first, then a body that stalls. The caller's handler brings its own redirect
+    /// and cookie behaviour: the production settings (<c>AllowAutoRedirect = false</c> and
+    /// <c>UseCookies = false</c>, see <see cref="CreateClient"/>) are deliberately not applied
+    /// here, so the seam cannot silently hide a handler that follows a redirect or sends cookies.
+    /// The production constructor is the one above.
     /// </summary>
     public HttpClientTransport(HttpMessageHandler handler)
     {
