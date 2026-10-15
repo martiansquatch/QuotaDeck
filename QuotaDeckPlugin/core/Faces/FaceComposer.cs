@@ -9,9 +9,9 @@ using QuotaDeck.Core.Text;
 ///
 /// Pure and total: every rule a key face needs lives here rather than in the renderer — the
 /// remaining/used flip and the band come from <see cref="FaceFigures"/>, the corner is the
-/// countdown of <see cref="ResetCopy"/>, and the words for a provider with no reading are a short
-/// port of Codenotch <c>Sources/Model/UsageModel.swift</c>'s <c>statusMessage</c> (lines 603-631,
-/// which drops the long auth sentences for the keypad's width).
+/// settings' countdown of <see cref="ResetCopy"/>, and the words for a provider with no reading are
+/// a short port of Codenotch <c>Sources/Model/UsageModel.swift</c>'s <c>statusMessage</c> (lines
+/// 603-631, which drops the long auth sentences for the keypad's width).
 /// </summary>
 public static class FaceComposer
 {
@@ -28,7 +28,7 @@ public static class FaceComposer
 
         var figures = FaceFigures.For(snapshot, settings);
         var countdown = snapshot.Headline?.ResetsAt is { } resetsAt
-            ? ResetCopy.Countdown(resetsAt, now)
+            ? Countdown(resetsAt, now, settings.CountdownStyle)
             : null;
 
         return new FaceModel(
@@ -41,6 +41,15 @@ public static class FaceComposer
             StatusTextFor(snapshot),
             snapshot.Block is not null || snapshot.IsDepleted);
     }
+
+    /// <summary>
+    /// The corner countdown in the chosen unit: Codenotch's own hours form by default ("72h 00m"),
+    /// or the days form ("3d 00h") when the settings ask for it.
+    /// </summary>
+    private static string? Countdown(DateTimeOffset resetsAt, DateTimeOffset now, CountdownStyle style) =>
+        style == CountdownStyle.Days
+            ? ResetCopy.CountdownWithDays(resetsAt, now)
+            : ResetCopy.Countdown(resetsAt, now);
 
     /// <summary>
     /// The words for a provider with no windows to show. A reading of any kind outranks them, so

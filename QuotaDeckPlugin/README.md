@@ -66,6 +66,7 @@ killall LogiPluginService
   "showRemaining": true,
   "watchLimit": 0.5,
   "criticalLimit": 0.7,
+  "countdownStyle": "Hours",
   "providers": {},
   "order": []
 }
@@ -75,6 +76,9 @@ killall LogiPluginService
   always judged by the *used* fraction, whichever end the figures show.
 - `watchLimit` / `criticalLimit` are the band boundaries. They are clamped on load: the watch limit
   stays below the critical limit, and the pair inside 0.01–1.0.
+- `countdownStyle` is the corner countdown's unit. `"Hours"` (the default) is Codenotch's own form,
+  "71h 00m"; `"Days"` shortens a multi-day window to "2d 23h" and leaves everything below a day
+  unchanged.
 - `providers` is per-reader enablement, schedule and rate-limit behaviour, keyed by reader id:
   `enabled`, `busyIntervalSeconds`, `idleIntervalSeconds`, `staleAfterMinutes`,
   `rateLimitBackoff`. A provider missing from the file gets the defaults (enabled, 30 s busy, 5 min

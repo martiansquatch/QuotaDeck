@@ -25,6 +25,15 @@ public class QuotaDeckSettings
     [JsonPropertyName("criticalLimit")]
     public double CriticalLimit { get; set; } = Model.Bands.DefaultCriticalLimit;
 
+    /// <summary>
+    /// How the corner countdown reads: <see cref="CountdownStyle.Hours"/> (the default) is
+    /// Codenotch's own "72h 00m", <see cref="CountdownStyle.Days"/> shortens it to "3d 00h" once at
+    /// least a day is left. Written as a name in config.json.
+    /// </summary>
+    [JsonPropertyName("countdownStyle")]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public CountdownStyle CountdownStyle { get; set; } = CountdownStyle.Hours;
+
     /// <summary>Per-provider schedule and enablement, keyed by reader id.</summary>
     [JsonPropertyName("providers")]
     public Dictionary<string, ReaderConfig> Providers { get; set; } = new(StringComparer.Ordinal);
@@ -48,11 +57,16 @@ public class QuotaDeckSettings
     /// The load-time repair. The property setters cannot do it here — an object initialiser runs no
     /// clamping code — so a stored pair that crossed over is fixed when the settings are read.
     /// A non-finite value would survive the comparisons and poison every band, so it is repaired too.
+    /// The enums are repaired the same way: the string reader refuses a name it does not know, but
+    /// a bare number can still land outside the enum.
     /// </summary>
     public void Normalize()
     {
         this.Providers ??= new Dictionary<string, ReaderConfig>(StringComparer.Ordinal);
         this.Order ??= [];
+        this.CountdownStyle = Enum.IsDefined(this.CountdownStyle)
+            ? this.CountdownStyle
+            : CountdownStyle.Hours;
 
         foreach (var key in this.Providers.Keys.ToList())
         {

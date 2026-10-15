@@ -142,6 +142,31 @@ public class SettingsTests
         Assert.Equal(RateLimitBackoff.Ladder, repaired.RateLimitBackoff);
     }
 
+    /// <summary>
+    /// The corner countdown's unit: Codenotch's hours form is the default, "Days" is the option,
+    /// written as a name, and a hand-edited number outside the enum is repaired to the default.
+    /// </summary>
+    [Fact]
+    public void TheCountdownStyleDefaultsToHoursAndRoundTripsByName()
+    {
+        Assert.Equal(CountdownStyle.Hours, new QuotaDeckSettings().CountdownStyle);
+
+        var settings = Load("""{ "countdownStyle": "Days" }""");
+        settings.Normalize();
+        Assert.Equal(CountdownStyle.Days, settings.CountdownStyle);
+
+        var json = JsonSerializer.Serialize(settings);
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal("Days", document.RootElement.GetProperty("countdownStyle").GetString());
+        var roundTrip = Load(json);
+        roundTrip.Normalize();
+        Assert.Equal(CountdownStyle.Days, roundTrip.CountdownStyle);
+
+        var repaired = new QuotaDeckSettings { CountdownStyle = (CountdownStyle)5 };
+        repaired.Normalize();
+        Assert.Equal(CountdownStyle.Hours, repaired.CountdownStyle);
+    }
+
     private static QuotaDeckSettings Load(string json) =>
         JsonSerializer.Deserialize<QuotaDeckSettings>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
 }
