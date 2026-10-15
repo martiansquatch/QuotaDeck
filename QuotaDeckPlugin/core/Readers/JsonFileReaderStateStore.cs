@@ -1,5 +1,6 @@
 namespace QuotaDeck.Core.Readers;
 
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using QuotaDeck.Core.Model;
@@ -12,13 +13,31 @@ using QuotaDeck.Core.Model;
 /// a reading is stored with its windows and the moment it was taken, and it is restored marked stale
 /// for that moment rather than trusting whatever status was current when it was written. The
 /// back-off deadline is stored beside it, for the reason given on <see cref="IReaderStateStore"/>.
+///
+/// One instance per path per process. Every reader must share the one store over the plugin's state
+/// file — each instance has its own lock, so two instances over the same file would race their
+/// read-modify-write cycles and silently lose entries. Create it through <see cref="ForPath"/>.
 /// </summary>
 public sealed class JsonFileReaderStateStore : IReaderStateStore
 {
+    private static readonly ConcurrentDictionary<string, JsonFileReaderStateStore> Instances = new(StringComparer.Ordinal);
+
     private readonly string _filePath;
     private readonly object _gate = new();
 
-    public JsonFileReaderStateStore(string filePath) => this._filePath = filePath;
+    private JsonFileReaderStateStore(string filePath) => this._filePath = filePath;
+
+    /// <summary>
+    /// The one store for a path. Two calls with the same file — however the path was spelled —
+    /// receive the same instance, which is what makes the plugin's single shared store possible.
+    /// </summary>
+    public static JsonFileReaderStateStore ForPath(string filePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        var fullPath = Path.GetFullPath(filePath);
+        return Instances.GetOrAdd(fullPath, path => new JsonFileReaderStateStore(path));
+    }
+
 
     public ReaderMemory? Load(string readerId)
     {
@@ -55,7 +74,9 @@ public sealed class JsonFileReaderStateStore : IReaderStateStore
     {
         lock (this._gate)
         {
-            return this.ReadFile().BackoffUntil.GetValueOrDefault(readerId);
+            // TryGetValue, not GetValueOrDefault: the latter answers a missing key with
+            // default(DateTimeOffset), which would read as a 0001 deadline rather than "none".
+            return this.ReadFile().BackoffUntil.TryGetValue(readerId, out var until) ? until : null;
         }
     }
 

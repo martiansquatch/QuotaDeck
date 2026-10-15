@@ -13,6 +13,9 @@ using QuotaDeck.Core.Text;
 ///
 /// Bands and thresholds are always judged by the used fraction, even when the figures are shown from
 /// the remaining end. Ring sweeps are clamped to what can be drawn.
+///
+/// <para><see cref="Band"/> is null when there is no used fraction to judge — that is not "no
+/// colour": the renderer must fall back to the provider's accent colour for the ring and the face.</para>
 /// </summary>
 public sealed record FaceFigures(string Headline, string? Secondary, double? RingSweep, UsageBand? Band)
 {

@@ -158,15 +158,173 @@ public class UsageReaderBaseTests
         Assert.Equal(0.80, heldOff.UsedFraction!.Value, 10);
     }
 
+    /// <summary>The spent week is attached at publication, not left to the drawing site: the
+    /// remembered reading carries the block, the band is Exhausted, and the limit watcher reads the
+    /// block as the weekly crossing it is.</summary>
     [Fact]
-    public async Task ASwitchedOffProviderIsNotRead()
+    public async Task ASpentWeekIsPublishedAsABlock()
     {
+        var reader = this.Reader();
+        reader.OnRead = (_, _) => Task.FromResult(TestData.SessionAndWeekly(0.30, 1.00));
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.NotNull(snapshot.Block);
+        Assert.True(snapshot.Block!.IsWeeklyExhaustion);
+        Assert.Equal("Weekly limit reached", snapshot.Block.Reason);
+        Assert.NotNull(this._store.Load("test")!.Snapshot.Block);
+        Assert.Equal(UsageBand.Exhausted, FaceFigures.For(snapshot, showRemaining: false).Band);
+
+        var alerts = new List<UsageAlertEvent>();
+        var watcher = new UsageLimitWatcher(deliver: alerts.Add);
+        watcher.Observe(TestData.SessionAndWeekly(0.30, 0.50));
+        watcher.Observe(snapshot);
+        Assert.Equal(new[] { UsageAlertKind.WeeklyLimitReached }, alerts.Select(alert => alert.Kind));
+    }
+
+    /// <summary>Cancellation is not a failure: the caller gets the last reading (or a placeholder
+    /// repeating the last status) and the store is not written.</summary>
+    [Fact]
+    public async Task ACancelledFetchIsNotPublishedAsAFailure()
+    {
+        var reader = this.Reader();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellation = new CancellationTokenSource();
+        reader.OnRead = async (_, token) =>
+        {
+            started.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            return TestData.SessionAndWeekly(0.5, 0.5);
+        };
+
+        var fetch = reader.FetchAsync(Freshness.Standard, cancellation.Token);
+        await started.Task;
+        cancellation.Cancel();
+
+        var snapshot = await fetch;
+
+        Assert.NotEqual(ProviderStatusKind.Error, snapshot.Status.Kind);
+        Assert.Empty(snapshot.Windows);
+        Assert.Null(this._store.Load("test"));
+        Assert.Null(this._store.LoadBackoffUntil("test"));
+    }
+
+    [Fact]
+    public async Task ACancelledCallerDoesNotStartARead()
+    {
+        var reader = this.Reader();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard, cancellation.Token);
+
+        Assert.Equal(0, reader.Calls);
+        Assert.NotEqual(ProviderStatusKind.Error, snapshot.Status.Kind);
+        Assert.Null(this._store.Load("test"));
+    }
+
+    /// <summary>An older read must not hand its result to a caller once a newer one has replaced it:
+    /// the caller gets the current reading, not the number it raced.</summary>
+    [Fact]
+    public async Task AnOutdatedReadingIsNotReturnedToItsCaller()
+    {
+        var reader = this.Reader();
+        var slowRead = new TaskCompletionSource<ProviderSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        reader.OnRead = (freshness, _) => freshness == Freshness.FromSource
+            ? Task.FromResult(TestData.SessionAndWeekly(0.60, 0.30))
+            : slowRead.Task;
+
+        var outdatedFetch = reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(1, reader.Calls);
+
+        // A look is an explicit request of its own: it supersedes the scheduled read in flight.
+        var newer = await reader.FetchAsync(Freshness.FromSource);
+        Assert.Equal(2, reader.Calls);
+        Assert.Equal(0.60, newer.UsedFraction!.Value, 10);
+
+        slowRead.SetResult(TestData.SessionAndWeekly(0.40, 0.20));
+        var outdated = await outdatedFetch;
+
+        Assert.Equal(0.60, outdated.UsedFraction!.Value, 10);
+        Assert.Equal(0.60, this._store.Load("test")!.Snapshot.UsedFraction!.Value, 10);
+    }
+
+    /// <summary>Concurrent scheduled fetches are one request: the second joins the read in flight
+    /// and both callers get its answer.</summary>
+    [Fact]
+    public async Task ConcurrentFetchesShareOneRead()
+    {
+        var reader = this.Reader();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        reader.OnRead = async (_, _) =>
+        {
+            await release.Task;
+            return TestData.SessionAndWeekly(0.42, 0.11);
+        };
+
+        var first = reader.FetchAsync(Freshness.Standard);
+        var second = reader.FetchAsync(Freshness.Standard);
+        release.SetResult();
+
+        var results = await Task.WhenAll(first, second);
+
+        Assert.Equal(1, reader.Calls);
+        Assert.Equal(results[0], results[1]);
+        Assert.Equal(0.42, results[0].UsedFraction!.Value, 10);
+    }
+
+    /// <summary>One coalesced 429 raises the ladder once: 60 s, not 60 s and then 120 s.</summary>
+    [Fact]
+    public async Task ConcurrentRateLimitedFetchesRecordOneBackoff()
+    {
+        var reader = this.Reader();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        reader.OnRead = async (_, _) =>
+        {
+            await release.Task;
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+
+        var first = reader.FetchAsync(Freshness.Standard);
+        var second = reader.FetchAsync(Freshness.Standard);
+        release.SetResult();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, reader.Calls);
+        Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>The stamp is when the read came back, not when it was asked for.</summary>
+    [Fact]
+    public async Task FetchedAtIsStampedWhenTheReadReturns()
+    {
+        var reader = this.Reader();
+        reader.OnRead = (_, _) =>
+        {
+            this._clock.Now = this._clock.Now.AddSeconds(50);
+            return Task.FromResult(TestData.SessionAndWeekly(0.2, 0.1));
+        };
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(TestData.Now.AddSeconds(50), snapshot.FetchedAt);
+        Assert.Equal(TestData.Now.AddSeconds(50), this._store.Load("test")!.FetchedAt);
+    }
+
+    /// <summary>A switched-off provider says so on its face without dropping the reading the switch
+    /// says nothing about.</summary>
+    [Fact]
+    public async Task ASwitchedOffProviderSaysSoWithoutForgettingHistory()
+    {
+        this._store.Seed("test", TestData.SessionAndWeekly(0.40, 0.20), TestData.Now.AddMinutes(-1));
         var reader = this.Reader(new ReaderConfig { Enabled = false });
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
 
         Assert.Equal(0, reader.Calls);
+        Assert.Equal(ProviderStatus.Unsupported("Disabled in settings"), snapshot.Status);
         Assert.Empty(snapshot.Windows);
+        Assert.NotNull(this._store.Load("test"));
     }
 
     private TestReader Reader(ReaderConfig? config = null, TimeSpan? deadline = null) =>

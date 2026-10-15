@@ -80,6 +80,23 @@ public class BackoffTests
 
         Assert.Equal(120d, Backoff.RetryAfter("Wed, 21 Oct 2015 07:30:00 GMT", now)!.Value.TotalSeconds);
         Assert.Equal(0d, Backoff.RetryAfter("Wed, 21 Oct 2015 07:00:00 GMT", now)!.Value.TotalSeconds);
+
+        // A date past the ceiling is clamped to it, like a numeric hint.
+        Assert.Equal(900d, Backoff.RetryAfter("Wed, 21 Oct 2015 09:28:00 GMT", now)!.Value.TotalSeconds);
+    }
+
+    /// <summary>A broken or hostile header must not become an endless hold-off: the non-finite
+    /// spellings .NET parses ("Infinity", "NaN") are not a hint, and a finite giant is clamped to
+    /// the fifteen-minute ceiling before the TimeSpan is built.</summary>
+    [Fact]
+    public void RetryAfterRejectsNonFiniteValuesAndClampsFiniteOnes()
+    {
+        Assert.Null(Backoff.RetryAfter("Infinity", TestData.Now));
+        Assert.Null(Backoff.RetryAfter("-Infinity", TestData.Now));
+        Assert.Null(Backoff.RetryAfter("NaN", TestData.Now));
+
+        Assert.Equal(900d, Backoff.RetryAfter("1e300", TestData.Now)!.Value.TotalSeconds);
+        Assert.Equal(120d, Backoff.RetryAfter("120", TestData.Now)!.Value.TotalSeconds);
     }
 
     [Fact]

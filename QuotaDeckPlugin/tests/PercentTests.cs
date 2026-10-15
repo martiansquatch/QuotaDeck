@@ -94,6 +94,18 @@ public class PercentTests
         Assert.Equal(100, int.Parse(halves.Used) + int.Parse(halves.Left));
     }
 
+    /// <summary>A tiny negative fraction rounds to negative zero, which .NET prints as "-0%". A zero
+    /// fraction has no direction; the sign is dropped before formatting.</summary>
+    [Fact]
+    public void ATinyNegativeFractionIsZeroNotNegativeZero()
+    {
+        Assert.Equal("0", Percent.Text(-0.001));
+        Assert.Equal(("0", "100"), Percent.Halves(-0.001));
+
+        Assert.Equal("0", Percent.Text(-0.0));
+        Assert.Equal(("0", "100"), Percent.Halves(-0.0));
+    }
+
     /// <summary>
     /// The one rule behind the ring's sweep and every flipped figure: spent by default, what is left
     /// when the face is set that way. Unclamped — callers draw 0…1, so an overspent limit reads empty

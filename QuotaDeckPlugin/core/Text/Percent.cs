@@ -104,5 +104,11 @@ public static class Percent
 
     private static double Round(double value) => Math.Round(value, MidpointRounding.AwayFromZero);
 
-    private static string Invariant(double value) => value.ToString("0", CultureInfo.InvariantCulture);
+    /// <summary>
+    /// Whole percents, with zero stripped of its sign: "(-0.001) * 100" rounds to negative zero,
+    /// and .NET prints negative zero as "-0". A zero fraction has no direction, and "-0%" is not a
+    /// percentage anyone reads.
+    /// </summary>
+    private static string Invariant(double value) =>
+        (value == 0 ? 0 : value).ToString("0", CultureInfo.InvariantCulture);
 }

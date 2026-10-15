@@ -12,8 +12,10 @@ using System.Globalization;
 ///
 /// The server's own hint is honoured only as a *floor-raiser*: it answers <c>Retry-After: 0</c>, and
 /// obeying that literally means retrying immediately, which is what keeps you rate limited. So the
-/// wait starts at a minute and doubles for each 429 in a row. Only our schedule is capped, never the
-/// server's hint.
+/// wait starts at a minute and doubles for each 429 in a row, and <see cref="Compute"/> never lowers
+/// a hint that is handed to it. <see cref="RetryAfter"/> caps the header itself at the same
+/// fifteen-minute ceiling — a deliberate hardening over Swift's pass-through, so a broken or hostile
+/// header cannot turn into an unbounded hold-off.
 /// </summary>
 public static class Backoff
 {
@@ -56,7 +58,10 @@ public static class Backoff
 
     /// <summary>
     /// <c>Retry-After</c> is either a number of seconds or an HTTP date (RFC 1123). Nil when the
-    /// header is missing or does not parse; a past date never yields a negative delay.
+    /// header is missing, does not parse, or is not finite; a past date never yields a negative
+    /// delay, and a finite hint is capped at <see cref="CeilingSeconds"/> so no header can hold a
+    /// reader off longer than the schedule's own ceiling. That cap is a deliberate departure from
+    /// Swift's <c>retryAfter(from:)</c>, which passes any number straight through.
     /// </summary>
     public static TimeSpan? RetryAfter(string? header, DateTimeOffset now)
     {
@@ -68,7 +73,12 @@ public static class Backoff
         var trimmed = header.Trim();
         if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
         {
-            return TimeSpan.FromSeconds(Math.Max(0, seconds));
+            // "Infinity" and "NaN" parse happily into doubles and then explode inside
+            // TimeSpan.FromSeconds; a non-finite hint is not a hint. A finite giant ("1e300")
+            // is clamped before the TimeSpan is built, which would otherwise overflow.
+            return double.IsFinite(seconds)
+                ? TimeSpan.FromSeconds(Math.Clamp(seconds, 0, CeilingSeconds))
+                : null;
         }
 
         if (DateTimeOffset.TryParseExact(
@@ -78,7 +88,7 @@ public static class Backoff
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
                 out var date))
         {
-            return TimeSpan.FromSeconds(Math.Max(0, (date - now).TotalSeconds));
+            return TimeSpan.FromSeconds(Math.Clamp((date - now).TotalSeconds, 0, CeilingSeconds));
         }
 
         return null;
