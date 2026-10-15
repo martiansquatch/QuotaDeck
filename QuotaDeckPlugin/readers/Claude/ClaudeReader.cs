@@ -95,6 +95,7 @@ public sealed class ClaudeReader : UsageReaderBase
     private static readonly TimeSpan EndpointTimeout = TimeSpan.FromSeconds(15);
 
     private readonly ClaudeReaderOptions _options;
+    private readonly EndpointHoldOffStore _store;
     private readonly string _home;
     private readonly IClaudeFileSystem _fileSystem;
     private readonly IKeychain _keychain;
@@ -156,11 +157,23 @@ public sealed class ClaudeReader : UsageReaderBase
     }
 
     public ClaudeReader(ClaudeReaderOptions options)
+        : this(StoreFor(options), options)
+    {
+    }
+
+    private static EndpointHoldOffStore StoreFor(ClaudeReaderOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return new EndpointHoldOffStore(options.Context.StateStore);
+    }
+
+    private ClaudeReader(EndpointHoldOffStore store, ClaudeReaderOptions options)
         : base(
-            (options ?? throw new ArgumentNullException(nameof(options))).Context.Config,
-            options.Context.StateStore,
+            options.Context.Config,
+            store,
             options.Context.TimeProvider)
     {
+        this._store = store;
         this._options = options;
         this._time = options.Context.TimeProvider;
         this._home = options.HomeDirectory ?? ClaudeProfile.HomeDirectory;
@@ -200,6 +213,17 @@ public sealed class ClaudeReader : UsageReaderBase
     public override string Id => this._profile.Id;
 
     public override string DisplayName => this._profile.DisplayName;
+
+    /// <summary>
+    /// The hold-off covers the endpoint step alone.
+    ///
+    /// Codenotch checks <c>retryNoEarlierThan</c> inside <c>fetchFromKeychain</c>
+    /// (<c>ClaudeOAuthProvider.swift:303-309</c>), *after* the Desktop cache and the CLI have had
+    /// their chance: the deadline is the endpoint's, and a 429 on it is no reason to darken a ring a
+    /// cheaper local source can still fill. See <see cref="ReadSnapshotAsync"/> for how the reader
+    /// applies it.
+    /// </summary>
+    protected override HoldOffScope HoldOffScope => HoldOffScope.ReaderManaged;
 
     /// <summary>The profile this reader draws, exposed so the module can name it in a log line.</summary>
     public ClaudeProfile Profile => this._profile;
@@ -254,6 +278,14 @@ public sealed class ClaudeReader : UsageReaderBase
         var now = this._time.GetUtcNow();
         var (desktopAllowance, cliAllowance, endpointAllowance) = this.Allowances(freshness);
 
+        // While the endpoint is held off, nothing below asks it — so whatever answers (the cache, the
+        // CLI, or the replay at the bottom), the success the base publishes must not lift the
+        // endpoint's penalty with it. The keep is disarmed the moment the endpoint itself is asked.
+        if (this.HoldOffUntil is { } deadline && Backoff.ShouldHoldOff(deadline, now))
+        {
+            this._store.KeepDeadline(deadline);
+        }
+
         // Ahead of both the CLI and the token: this is the cheapest source and the only one that can
         // never interrupt anyone.
         var desktop = this.DesktopReading(now);
@@ -291,6 +323,37 @@ public sealed class ClaudeReader : UsageReaderBase
                 return this.Snapshot(windows, this._lastCliPlan);
             }
         }
+
+        // The endpoint is the only step the hold-off covers, and it is checked here — after the cache
+        // and the CLI, exactly where Codenotch checks `retryNoEarlierThan`. While the penalty
+        // stands, the two cheaper sources above have already had their chance; the endpoint is not
+        // asked, so a poll cannot fire back into the limit that caused it.
+        if (this.IsHeldOff(now))
+        {
+            // A reading that arrived but was skipped only because of a tighter allowance is still the
+            // best answer there is: asking for a fresher one must never leave the ring emptier.
+            if (desktop is { } held && showable && desktopAllowance < this._desktopFreshness)
+            {
+                return this.Snapshot(held.Windows, this._profile.OrganizationPlan());
+            }
+
+            // Nothing else answered and the endpoint may not be asked: hand back what is remembered,
+            // in the shape the base's own hold-off produces — the last reading, dimmed and dated once
+            // it is old enough, or a placeholder carrying the status when there is nothing to show.
+            // Returning it is a success to the base, which is why the deadline was kept above: the
+            // penalty belongs to the endpoint, and this read did not ask it.
+            return Degradation.Degrade(
+                this.Id,
+                this.DisplayName,
+                this._options.Context.StateStore.Load(this.Id),
+                ProviderStatus.Stale(now),
+                now,
+                this.StaleAfter);
+        }
+
+        // About to ask the endpoint: from here a success is the endpoint's own, and clearing its
+        // deadline with it is exactly right.
+        this._store.ReleaseDeadline();
 
         try
         {
@@ -663,4 +726,51 @@ public sealed class ClaudeReader : UsageReaderBase
             : null;
 
     private static TimeSpan Min(TimeSpan left, TimeSpan right) => left < right ? left : right;
+
+    /// <summary>
+    /// The store the base writes through, with one narrow power: keeping the endpoint's 429 deadline
+    /// across a read that never asked the endpoint.
+    ///
+    /// The base clears the deadline on every *success*, which is right when the endpoint answered and
+    /// wrong for a <see cref="HoldOffScope.ReaderManaged"/> reader when a cheaper source did — a
+    /// Desktop cache hit or a CLI answer says nothing about the endpoint's rate limit, and Codenotch
+    /// clears <c>retryNoEarlierThan</c> only inside the endpoint's own success path. So a held-off
+    /// read arms <see cref="KeepDeadline"/> and the next *clear* is turned back into the deadline it
+    /// would have removed; a real 429's write (a concurrent fetch, say) passes through untouched, and
+    /// the keep is disarmed the moment the reader is about to ask the endpoint, so a clear after a
+    /// successful endpoint fetch is never swallowed.
+    /// </summary>
+    private sealed class EndpointHoldOffStore(IReaderStateStore inner) : IReaderStateStore
+    {
+        private long _keptTicks = -1;
+
+        public void KeepDeadline(DateTimeOffset deadline) =>
+            Interlocked.Exchange(ref this._keptTicks, deadline.ToUnixTimeMilliseconds());
+
+        public void ReleaseDeadline() => Interlocked.Exchange(ref this._keptTicks, -1);
+
+        public ReaderMemory? Load(string readerId) => inner.Load(readerId);
+
+        public void Save(string readerId, ReaderMemory memory) => inner.Save(readerId, memory);
+
+        public void Forget(string readerId) => inner.Forget(readerId);
+
+        public DateTimeOffset? LoadBackoffUntil(string readerId) => inner.LoadBackoffUntil(readerId);
+
+        public void SaveBackoffUntil(string readerId, DateTimeOffset? until)
+        {
+            if (until is null)
+            {
+                var kept = Interlocked.Exchange(ref this._keptTicks, -1);
+                if (kept >= 0)
+                {
+                    // The clear belongs to a read that did not ask the endpoint: put the deadline back.
+                    inner.SaveBackoffUntil(readerId, DateTimeOffset.FromUnixTimeMilliseconds(kept));
+                    return;
+                }
+            }
+
+            inner.SaveBackoffUntil(readerId, until);
+        }
+    }
 }

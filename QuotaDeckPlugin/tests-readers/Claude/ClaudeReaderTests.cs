@@ -419,6 +419,88 @@ public class ClaudeReaderTests
         Assert.Equal(0.42, snapshot.UsedFraction!.Value, 4);
     }
 
+    // MARK: - The hold-off covers the endpoint only
+
+    /// <summary>
+    /// The review's failing input: with the whole read held off, a penalty on the endpoint darkened a
+    /// ring the cache could still fill. The cache is read first, exactly where Codenotch checks
+    /// `retryNoEarlierThan` — after the Desktop step, not before it.
+    /// </summary>
+    [Fact]
+    public async Task WhileHeldOffAFreshDesktopEntryStillAnswers()
+    {
+        this._rig.AddDesktopEntry();
+        var deadline = this._rig.Clock.Now.AddMinutes(30);
+        this._rig.Store.SaveBackoffUntil("claude", deadline);
+        var reader = this._rig.Reader();
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(ProviderStatusKind.Ok, snapshot.Status.Kind);
+        Assert.Equal(0.30, snapshot.UsedFraction!.Value, 4);
+        Assert.Empty(this._rig.Http.Requests);
+
+        // A cache hit says nothing about the endpoint's rate limit, so the penalty stands.
+        Assert.Equal(deadline, this._rig.Store.LoadBackoffUntil("claude"));
+    }
+
+    /// <summary>The CLI is the second source the hold-off must not darken.</summary>
+    [Fact]
+    public async Task WhileHeldOffTheCliStillAnswers()
+    {
+        var cli = new FakeClaudeUsageCli(() => this.CliAnswer());
+        var deadline = this._rig.Clock.Now.AddMinutes(30);
+        this._rig.Store.SaveBackoffUntil("claude", deadline);
+        var reader = this._rig.Reader(options => options.CliFactory = () => cli);
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(0.38, snapshot.UsedFraction!.Value, 4);
+        Assert.Equal(1, cli.Spawns);
+        Assert.Empty(this._rig.Http.Requests);
+        Assert.Equal(deadline, this._rig.Store.LoadBackoffUntil("claude"));
+    }
+
+    /// <summary>
+    /// Nothing else can answer: the last reading ages rather than being replaced, no request is spent,
+    /// and the penalty is neither extended nor lifted.
+    /// </summary>
+    [Fact]
+    public async Task WhileHeldOffWithNothingElseAnsweringTheReadingAges()
+    {
+        this._rig.Http.Respond(HttpStatusCode.OK, UsagePayload);
+        var reader = this._rig.Reader();
+        var fresh = await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(0.42, fresh.UsedFraction!.Value, 4);
+
+        // Old enough to be dimmed, and the endpoint is held off for half an hour.
+        this._rig.Clock.Advance(TimeSpan.FromMinutes(16));
+        var deadline = this._rig.Clock.Now.AddMinutes(30);
+        this._rig.Store.SaveBackoffUntil("claude", deadline);
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
+        Assert.Equal(fresh.FetchedAt, snapshot.Status.StaleSince);
+        Assert.Equal(0.42, snapshot.UsedFraction!.Value, 4);
+        Assert.Single(this._rig.Http.Requests);
+        Assert.Equal(deadline, this._rig.Store.LoadBackoffUntil("claude"));
+    }
+
+    /// <summary>With nothing remembered, the held-off read is a placeholder carrying the status.</summary>
+    [Fact]
+    public async Task WhileHeldOffWithNoReadingAtAllTheFaceIsEmpty()
+    {
+        this._rig.Store.SaveBackoffUntil("claude", this._rig.Clock.Now.AddMinutes(30));
+        var reader = this._rig.Reader();
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
+        Assert.Empty(snapshot.Windows);
+        Assert.Empty(this._rig.Http.Requests);
+    }
+
     // MARK: - Where the CLI is not what answers
 
     /// <summary>A machine with no CLI at all keeps working exactly as it did.</summary>

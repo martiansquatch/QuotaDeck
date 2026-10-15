@@ -19,3 +19,14 @@ What is here:
 Only the default profile (`~/.claude`) is drawn in this build; discovery finds the other logins and
 logs them. Reset credits (`cedar_ember`) have no field in `QuotaDeck.Core`'s snapshot and are not
 carried.
+
+The endpoint's 429 hold-off is the reader's own to apply: `ClaudeReader` takes
+`HoldOffScope.ReaderManaged`, so a penalty stands for the usage endpoint alone and the Desktop cache
+and `claude /usage` still get their turn — Codenotch checks `retryNoEarlierThan` inside the keychain
+step (`ClaudeOAuthProvider.swift:303-309`), after both. While the penalty stands, a read that did not
+ask the endpoint keeps it in place (`EndpointHoldOffStore`, because the base clears the deadline on
+every success and a cache or CLI answer says nothing about the endpoint's rate limit), and a read
+with nothing else to show hands back the last reading, aged, without spending a request. The token
+renewal is one atomic claim (`ClaudeTokenRefresher.TryClaim`): two fetches finishing together cannot
+launch two `claude -p` processes for one expiry, and the renewal runs on its own task *after* the
+reading, so a slow `claude` start never spends the fetch's deadline.

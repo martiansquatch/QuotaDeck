@@ -66,7 +66,13 @@ public sealed class ClaudeTokenRefresher
     private readonly TimeSpan _cooldown;
     private readonly TimeSpan _timeout;
 
-    private bool _isRunning;
+    /// <summary>
+    /// 1 while a renewal is in flight, 0 otherwise, claimed with
+    /// <see cref="TryClaim"/> — two fetches finishing together must not launch two `claude -p`
+    /// processes for one expiry.
+    /// </summary>
+    private int _isRunning;
+
     private DateTimeOffset? _lastAttempt;
     private DateTimeOffset? _attemptedFor;
 
@@ -98,7 +104,15 @@ public sealed class ClaudeTokenRefresher
     public ClaudeRenewalOutcome Outcome { get; private set; } = new(ClaudeRenewalState.Idle, null, null);
 
     /// <summary>Exposed for the test that proves the guard is claimed before the first await.</summary>
-    public bool IsRunning => this._isRunning;
+    public bool IsRunning => Volatile.Read(ref this._isRunning) != 0;
+
+    /// <summary>
+    /// The overlap guard, as one atomic claim: the first caller to move the flag from 0 to 1 wins,
+    /// everyone else is told to leave. A check-then-set pair would leave a window — narrow, but a
+    /// real one when two fetches finish together on two threads — in which both callers see 0 and
+    /// both launch a process for the same expiry.
+    /// </summary>
+    public static bool TryClaim(ref int flag) => Interlocked.CompareExchange(ref flag, 1, 0) == 0;
 
     /// <summary>
     /// Whether a launch is worth making. Pure, so every branch is testable without a clock, a
@@ -144,14 +158,13 @@ public sealed class ClaudeTokenRefresher
     /// <summary>One tick of the refresher: decide, launch, judge the outcome.</summary>
     public async Task ConsiderRenewingAsync(DateTimeOffset now, CancellationToken cancellationToken = default)
     {
-        // Claimed synchronously, before anything is awaited: it is what makes "at most one launch"
-        // true unconditionally.
-        if (this._isRunning)
+        // Claimed synchronously, before anything is awaited, and atomically: it is what makes "at
+        // most one launch" true unconditionally, including for two fetches finishing together.
+        if (!TryClaim(ref this._isRunning))
         {
             return;
         }
 
-        this._isRunning = true;
         try
         {
             var current = this._expiry();
@@ -223,7 +236,7 @@ public sealed class ClaudeTokenRefresher
         }
         finally
         {
-            this._isRunning = false;
+            Volatile.Write(ref this._isRunning, 0);
         }
     }
 

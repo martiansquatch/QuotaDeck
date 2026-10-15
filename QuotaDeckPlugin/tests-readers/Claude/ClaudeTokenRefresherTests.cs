@@ -145,6 +145,90 @@ public class ClaudeTokenRefresherTests
         Assert.Empty(process.Requests);
     }
 
+    // MARK: - One launch, whatever the interleaving
+
+    /// <summary>
+    /// Two fetches finishing together must not launch two `claude -p` processes for one expiry. The
+    /// winner blocks inside its process while the rest arrive, and every one of them is told to leave.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentRenewalTriggersLaunchOneProcess()
+    {
+        using var started = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var process = new ScriptedProcessRunner
+        {
+            OnRun = _ =>
+            {
+                started.Set();
+                release.Wait(TimeSpan.FromSeconds(30));
+                return new ProcessResult { ExitCode = 1, StandardOutput = string.Empty };
+            },
+        };
+        var refresher = Refresher(process, () => In(60), () => In(8 * 3600));
+
+        try
+        {
+            var winner = Task.Run(() => refresher.ConsiderRenewingAsync(Now));
+            Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the renewal never started");
+
+            // Seven more triggers, arriving while the first is mid-process.
+            var losers = Enumerable.Range(0, 7)
+                .Select(_ => refresher.ConsiderRenewingAsync(Now))
+                .ToList();
+            await Task.WhenAll(losers);
+
+            Assert.True(refresher.IsRunning, "the winner's claim was lost while it ran");
+            Assert.Single(process.Requests);
+
+            release.Set();
+            await winner;
+            Assert.Single(process.Requests);
+        }
+        finally
+        {
+            release.Set();
+        }
+    }
+
+    /// <summary>
+    /// The claim itself, hammered: a check-then-set pair leaves a window in which two callers both
+    /// see 0, and a single atomic exchange cannot.
+    /// </summary>
+    [Fact]
+    public void TheOverlapGuardHasExactlyOneWinnerPerRound()
+    {
+        const int Threads = 8;
+        for (var round = 0; round < 500; round++)
+        {
+            var flag = 0;
+            var winners = 0;
+            using var gate = new Barrier(Threads);
+            var threads = Enumerable.Range(0, Threads)
+                .Select(_ => new Thread(() =>
+                {
+                    gate.SignalAndWait();
+                    if (ClaudeTokenRefresher.TryClaim(ref flag))
+                    {
+                        Interlocked.Increment(ref winners);
+                    }
+                }))
+                .ToList();
+
+            foreach (var thread in threads)
+            {
+                thread.Start();
+            }
+
+            foreach (var thread in threads)
+            {
+                thread.Join();
+            }
+
+            Assert.Equal(1, winners);
+        }
+    }
+
     // MARK: - Through the reader
 
     /// <summary>
