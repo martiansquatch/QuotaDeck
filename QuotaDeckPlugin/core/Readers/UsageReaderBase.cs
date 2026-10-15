@@ -51,13 +51,22 @@ public abstract class UsageReaderBase : IUsageReader
     private int _consecutiveRateLimits;
 
     /// <summary>
-    /// Whether this cycle's read asked the source the hold-off covers — set by
-    /// <see cref="MarkRateLimitedSourceConsulted"/> from inside <c>ReadAsync</c>, reset under the
-    /// fetch gate when the cycle starts, and read under the same gate when the outcome is judged.
-    /// A plain field, not an <c>AsyncLocal</c>: a read cycle runs its read exactly once, so one
-    /// field is enough to tell a cache answer from an endpoint one.
+    /// The cycle the current async flow belongs to, so <see cref="MarkRateLimitedSourceConsulted"/>
+    /// reaches ITS OWN cycle's state without a parameter on <c>ReadAsync</c>. Cycles overlap by
+    /// design — a look supersedes an in-flight scheduled read — and one flag on the reader would
+    /// let one cycle's verdict be read by another's: a look starting mid-read could erase the rung
+    /// the older cycle's real 429 had earned, and the older cycle's endpoint visit could vouch for
+    /// a newer cycle that only read a cache. Every cycle writes its own state before it starts its
+    /// read, so no value another cycle set is ever read.
     /// </summary>
-    private bool _rateLimitedSourceConsulted;
+    private readonly AsyncLocal<CycleState?> _cycle = new();
+
+    /// <summary>One read cycle's own state, created with the cycle and flowing through its read.</summary>
+    private sealed class CycleState
+    {
+        /// <summary>Whether this cycle's read asked the source the hold-off covers.</summary>
+        public bool Consulted { get; set; }
+    }
 
     /// <summary>
     /// What the last published result said. A cancellation repeats this instead of inventing a
@@ -120,11 +129,18 @@ public abstract class UsageReaderBase : IUsageReader
     /// <summary>
     /// Says that this read actually asked the source the hold-off covers; a
     /// <see cref="HoldOffScope.ReaderManaged"/> reader calls it immediately before that request.
-    /// The base cannot tell a Desktop-cache answer from an endpoint one, so only a read that
-    /// consulted the source may reset the ladder and clear the deadline on success, or take a rung
-    /// and rewrite the deadline on a 429. Reset at the start of every read cycle.
+    /// It marks the CURRENT cycle's own state, so an overlapping cycle's reads and verdicts are
+    /// untouched. The base cannot tell a Desktop-cache answer from an endpoint one, so only a read
+    /// that consulted the source may reset the ladder and clear the deadline on success, or take a
+    /// rung and rewrite the deadline on a 429. A no-op outside a read cycle.
     /// </summary>
-    protected void MarkRateLimitedSourceConsulted() => this._rateLimitedSourceConsulted = true;
+    protected void MarkRateLimitedSourceConsulted()
+    {
+        if (this._cycle.Value is { } cycle)
+        {
+            cycle.Consulted = true;
+        }
+    }
 
     /// <summary>
     /// How long one fetch gets before this class stops waiting for it.
@@ -192,12 +208,11 @@ public abstract class UsageReaderBase : IUsageReader
                 {
                     // The generation moves under the gate, and Success re-checks it under the same
                     // gate before saving, so two cycles finishing together cannot overwrite the
-                    // newer reading with the older one. The consulted flag belongs to this cycle:
-                    // cleared here, set by the read if it asks the held-off source, and read once
-                    // more under this gate when the outcome is judged.
-                    this._rateLimitedSourceConsulted = false;
+                    // newer reading with the older one. The cycle's consulted state is created
+                    // with it and flows through its read: an overlapping cycle neither resets nor
+                    // inherits it.
                     var generation = ++this._generation;
-                    cycle = this.RunReadCycle(generation, freshness, cancellationToken);
+                    cycle = this.RunReadCycle(generation, new CycleState(), freshness, cancellationToken);
                     this._inFlight = (cycle, freshness);
                 }
             }
@@ -226,9 +241,15 @@ public abstract class UsageReaderBase : IUsageReader
 
     private async Task<ProviderSnapshot> RunReadCycle(
         int generation,
+        CycleState cycle,
         Freshness freshness,
         CancellationToken cancellationToken)
     {
+        // This cycle's verdict travels with its read: written by the cycle that owns it, before
+        // the read starts, and read back only through the cycle's own outcome judgement. A
+        // superseding cycle runs in its own flow with its own state.
+        this._cycle.Value = cycle;
+
         Task<ProviderSnapshot> read;
         try
         {
@@ -239,7 +260,7 @@ public abstract class UsageReaderBase : IUsageReader
             var caughtAt = this._time.GetUtcNow();
             return cancellationToken.IsCancellationRequested
                 ? this.Cancelled(caughtAt)
-                : this.Failed(exception, caughtAt);
+                : this.Failed(exception, cycle, caughtAt);
         }
 
         var deadline = Task.Delay(this.FetchDeadline, this._time, cancellationToken);
@@ -256,8 +277,8 @@ public abstract class UsageReaderBase : IUsageReader
 
             // The abandoned read reports nowhere, but its answer may still be the freshest one
             // this reader has if nothing newer has started.
-            _ = this.RememberLate(read, generation);
-            return this.OnFailure(ReaderError.TimedOut, caughtAt);
+            _ = this.RememberLate(read, generation, cycle);
+            return this.OnFailure(ReaderError.TimedOut, cycle, caughtAt);
         }
 
         try
@@ -270,7 +291,7 @@ public abstract class UsageReaderBase : IUsageReader
                 return this.Cancelled(this._time.GetUtcNow());
             }
 
-            return this.Success(fresh, generation, this._time.GetUtcNow());
+            return this.Success(fresh, generation, cycle, this._time.GetUtcNow());
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -284,14 +305,14 @@ public abstract class UsageReaderBase : IUsageReader
             // is untouched. That is a hung endpoint, not a cancellation: it reads as no response
             // and is recorded like any other failure — Swift maps the URLSession timeout the same
             // way. The guard above is what keeps this case out of the cancellation path.
-            return this.OnFailure(ReaderError.TimedOut, this._time.GetUtcNow());
+            return this.OnFailure(ReaderError.TimedOut, cycle, this._time.GetUtcNow());
         }
         catch (Exception exception)
         {
             var caughtAt = this._time.GetUtcNow();
             return cancellationToken.IsCancellationRequested
                 ? this.Cancelled(caughtAt)
-                : this.Failed(exception, caughtAt);
+                : this.Failed(exception, cycle, caughtAt);
         }
     }
 
@@ -301,7 +322,11 @@ public abstract class UsageReaderBase : IUsageReader
     /// increment, so two cycles finishing together cannot both pass the check and let the older
     /// save land after the newer one.
     /// </summary>
-    private ProviderSnapshot Success(ProviderSnapshot fresh, int generation, DateTimeOffset returnedAt)
+    private ProviderSnapshot Success(
+        ProviderSnapshot fresh,
+        int generation,
+        CycleState cycle,
+        DateTimeOffset returnedAt)
     {
         // The spent-week block is applied at publication, like the store's `blockingSpentWeek()`: a
         // weekly allowance at its limit shuts the headline with it, whatever the session reading
@@ -323,7 +348,7 @@ public abstract class UsageReaderBase : IUsageReader
             // answer, say — is still a fresh reading, so it is stored; but it says nothing about
             // that source, so the ladder and the deadline are left exactly as they were. A
             // WholeRead read is every source by definition.
-            if (this.HoldOffScope == HoldOffScope.WholeRead || this._rateLimitedSourceConsulted)
+            if (this.MovesTheLadder(cycle))
             {
                 Interlocked.Exchange(ref this._consecutiveRateLimits, 0);
                 this._store.SaveBackoffUntil(this.Id, null);
@@ -335,7 +360,7 @@ public abstract class UsageReaderBase : IUsageReader
         }
     }
 
-    private async Task RememberLate(Task<ProviderSnapshot> read, int generation)
+    private async Task RememberLate(Task<ProviderSnapshot> read, int generation, CycleState cycle)
     {
         try
         {
@@ -343,7 +368,7 @@ public abstract class UsageReaderBase : IUsageReader
 
             // Stamped when it actually returned, like any other success. Success itself decides
             // whether this generation is still the current one.
-            this.Success(fresh, generation, this._time.GetUtcNow());
+            this.Success(fresh, generation, cycle, this._time.GetUtcNow());
         }
         catch
         {
@@ -356,42 +381,57 @@ public abstract class UsageReaderBase : IUsageReader
     /// goes through <see cref="OnFailure"/>, which is where a 429's hold-off is recorded; anything
     /// else is a bug being reported and reads as its message.
     /// </summary>
-    private ProviderSnapshot Failed(Exception exception, DateTimeOffset now) =>
+    private ProviderSnapshot Failed(Exception exception, CycleState cycle, DateTimeOffset now) =>
         exception is ReaderException readerException
-            ? this.OnFailure(readerException.Error, now)
+            ? this.OnFailure(readerException.Error, cycle, now)
             : this.Degraded(Degradation.StatusFor(exception, now), now);
 
-    private ProviderSnapshot OnFailure(ReaderError error, DateTimeOffset now)
+    private ProviderSnapshot OnFailure(ReaderError error, CycleState cycle, DateTimeOffset now)
     {
         if (error.Kind == ReaderErrorKind.RateLimited)
         {
-            if (this.HoldOffScope == HoldOffScope.ReaderManaged && !this._rateLimitedSourceConsulted)
+            lock (this._fetchGate)
             {
-                // A replay, not a new 429: the reader is honouring a hold-off it already has.
-                // Taking a rung or writing the deadline again would ratchet both on every cached
-                // cycle; instead the reading degrades through the normal path — nothing is saved,
-                // and a dimmed reading keeps its own FetchedAt as the Stale since.
-                return this.Degraded(ProviderStatus.Stale(now), now);
-            }
+                // The verdict is read under the same gate the other outcome judges under. The
+                // cycle-owned state means there is no other writer to race, but this keeps the
+                // pair of decisions — take a rung, write the deadline — one judgement.
+                if (!this.MovesTheLadder(cycle))
+                {
+                    // A replay, not a new 429: the reader is honouring a hold-off it already has.
+                    // Taking a rung or writing the deadline again would ratchet both on every
+                    // cached cycle; instead the reading degrades through the normal path —
+                    // nothing is saved, and a dimmed reading keeps its own FetchedAt as the Stale
+                    // since.
+                    return this.Degraded(ProviderStatus.Stale(now), now);
+                }
 
-            // The server's hint is honoured only as a floor-raiser: it answers `Retry-After: 0`, and
-            // obeying that literally is what keeps you rate limited. Which wait follows the hint
-            // depends on the provider's own counterpart: the ladder starts at a minute and doubles
-            // for each 429 in a row, stopping at fifteen (Claude); OpenCode's ladder is the same but
-            // caps the whole wait, hint included; Codex, Devin and Muse wait a flat max(60, hint)
-            // every time. The deadline outlives the process either way. Only the climbing styles
-            // consume a rung — a flat wait must not leave the ladder higher for a later climb.
-            var wait = this.RateLimitBackoffStyle switch
-            {
-                RateLimitBackoff.Flat => Backoff.Flat(error.RetryAfter),
-                RateLimitBackoff.LadderCapped => Backoff.LadderCapped(this.NextLadderRung(), error.RetryAfter),
-                _ => Backoff.Compute(this.NextLadderRung(), error.RetryAfter),
-            };
-            this._store.SaveBackoffUntil(this.Id, now + wait);
+                // The server's hint is honoured only as a floor-raiser: it answers `Retry-After: 0`, and
+                // obeying that literally is what keeps you rate limited. Which wait follows the hint
+                // depends on the provider's own counterpart: the ladder starts at a minute and doubles
+                // for each 429 in a row, stopping at fifteen (Claude); OpenCode's ladder is the same but
+                // caps the whole wait, hint included; Codex, Devin and Muse wait a flat max(60, hint)
+                // every time. The deadline outlives the process either way. Only the climbing styles
+                // consume a rung — a flat wait must not leave the ladder higher for a later climb.
+                var wait = this.RateLimitBackoffStyle switch
+                {
+                    RateLimitBackoff.Flat => Backoff.Flat(error.RetryAfter),
+                    RateLimitBackoff.LadderCapped => Backoff.LadderCapped(this.NextLadderRung(), error.RetryAfter),
+                    _ => Backoff.Compute(this.NextLadderRung(), error.RetryAfter),
+                };
+                this._store.SaveBackoffUntil(this.Id, now + wait);
+            }
         }
 
         return this.Degraded(Degradation.StatusFor(error, now), now);
     }
+
+    /// <summary>
+    /// Whether an outcome may move the ladder and the deadline: a WholeRead read is every source
+    /// by definition, and a ReaderManaged read only when its own cycle actually asked the held-off
+    /// source.
+    /// </summary>
+    private bool MovesTheLadder(CycleState cycle) =>
+        this.HoldOffScope == HoldOffScope.WholeRead || cycle.Consulted;
 
     /// <summary>
     /// The rung this 429 takes, raised atomically: two cycles (a scheduled read and a superseding
