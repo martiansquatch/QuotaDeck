@@ -3,6 +3,7 @@ namespace QuotaDeck.Readers.OpenCode;
 using QuotaDeck.Core.Model;
 using QuotaDeck.Core.Policy;
 using QuotaDeck.Core.Readers;
+using QuotaDeck.Core.Settings;
 
 /// <summary>
 /// Reads OpenCode Go plan usage through <see cref="OpenCodeProvider"/> and publishes it as a
@@ -11,8 +12,8 @@ using QuotaDeck.Core.Readers;
 /// Port of Codenotch <c>Sources/Providers/OpenCodeProvider.swift</c> (<c>fetchSnapshot()</c> lines
 /// 61-105: the credential re-read, the parse, the snapshot shape and the constants). The rate-limit
 /// bookkeeping that lives beside it in Swift — the hold-off check, the consecutive counter, the
-/// back-off save — belongs to <see cref="UsageReaderBase"/> here, the same bargain every QuotaDeck
-/// reader makes.
+/// back-off save — belongs to <see cref="UsageReaderBase"/> here, with the whole-wait cap pinned
+/// through <see cref="RateLimitBackoffStyle"/>, the same bargain every QuotaDeck reader makes.
 ///
 /// The credential is re-read from disk on every fetch: an ordinary file, not a keychain item, so
 /// reading it puts no prompt in front of anyone. The files come from OpenCode's own data directory
@@ -50,6 +51,15 @@ public sealed class OpenCodeReader : UsageReaderBase
     public override string Id => ReaderId;
 
     public override string DisplayName => ReaderDisplayName;
+
+    /// <summary>
+    /// OpenCode caps the *whole* wait at 900 s, the server's hint included —
+    /// <c>min(900, max(60·2^min(n,4), hint))</c>, <c>OpenCodeProvider.swift:206-211</c> — where the
+    /// default ladder caps only the doubling and honours a larger hint in full (Claude's rule). The
+    /// schedule is the provider's own, so it is pinned here rather than left to configuration, and
+    /// it still doubles per consecutive 429.
+    /// </summary>
+    protected override RateLimitBackoff RateLimitBackoffStyle => RateLimitBackoff.LadderCapped;
 
     protected override async Task<ProviderSnapshot> ReadAsync(Freshness freshness, CancellationToken cancellationToken)
     {
