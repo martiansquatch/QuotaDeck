@@ -1,5 +1,6 @@
 namespace QuotaDeck.Readers.Tests.Claude;
 
+using System.Net;
 using QuotaDeck.Core.Policy;
 using QuotaDeck.Core.Readers;
 using QuotaDeck.Core.Readers.Services;
@@ -33,8 +34,16 @@ public sealed class ClaudeLiveTests
         var process = new QuotaDeck.Readers.Shared.ProcessRunner();
         var profile = ClaudeProfile.Default(home, fileSystem);
 
-        var step = await this.WhichStepAnswersAsync(home, profile, fileSystem, keychain, process);
-        this._output.WriteLine($"live: step that answered: {step}");
+        // Each step is probed on its own first, so a failure names itself and the PR can say which
+        // source answered. The two slow probes run before the cache probe: Claude Desktop rewrites
+        // its entry while a `claude` subprocess starts, and the desktop answer is the one that has
+        // to be current for the comparison below to mean anything.
+        var cli = await this.ProbeCliAsync(home, profile, fileSystem, process);
+        var endpoint = await this.ProbeEndpointAsync(profile, keychain, process);
+        var desktop = await this.ProbeDesktopAsync(home, profile, fileSystem);
+        this._output.WriteLine($"live: cli step: {cli}");
+        this._output.WriteLine($"live: endpoint step: {endpoint}");
+        this._output.WriteLine($"live: desktop step: {desktop}");
 
         var reader = new ClaudeReader(new ClaudeReaderOptions
         {
@@ -53,79 +62,101 @@ public sealed class ClaudeLiveTests
         });
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
+        var ids = string.Join(", ", snapshot.Windows.Select(window => window.Id));
+        this._output.WriteLine($"live: reader status {snapshot.Status.Kind}, windows [{ids}]");
 
-        this._output.WriteLine(
-            $"live: reader status {snapshot.Status.Kind}, windows [{string.Join(", ", snapshot.Windows.Select(window => window.Id))}]");
+        var answered = new[] { desktop, cli, endpoint }
+            .FirstOrDefault(step => step.Contains($"[{ids}]", StringComparison.Ordinal));
+        this._output.WriteLine($"live: reader answered from: {answered ?? "a source that moved between probes"}");
 
         Assert.Contains(snapshot.Windows, window => window.Id == "session");
     }
 
-    /// <summary>
-    /// The three steps, in the reader's own order, each answering "could this source carry a
-    /// reading right now?" — the report the PR asks for, and the reason a failure here names itself.
-    /// </summary>
-    private async Task<string> WhichStepAnswersAsync(
-        string home,
-        ClaudeProfile profile,
-        IClaudeFileSystem fileSystem,
-        IKeychain keychain,
-        IProcessRunner process)
+    private async Task<string> ProbeDesktopAsync(string home, ClaudeProfile profile, IClaudeFileSystem fileSystem)
     {
-        // Step A: Claude Desktop's cache.
         try
         {
-            if (profile.OrganizationId() is { } organization)
+            if (profile.OrganizationId() is not { } organization)
             {
-                var cache = new ClaudeDesktopUsageCache(
-                    ClaudeDesktopUsageCache.DefaultDirectory(home), fileSystem);
-                var reading = cache.Read(organization, DateTimeOffset.UtcNow);
-                if (reading is { Windows.Count: > 0 })
-                {
-                    return $"desktop ({string.Join(", ", reading.Windows.Select(window => window.Id))})";
-                }
+                return "none (no organization recorded)";
             }
+
+            var now = DateTimeOffset.UtcNow;
+            var reading = new ClaudeDesktopUsageCache(ClaudeDesktopUsageCache.DefaultDirectory(home), fileSystem)
+                .Read(organization, now);
+            if (reading is not { Windows.Count: > 0 })
+            {
+                return "none (no usable entry)";
+            }
+
+            // Age and staleness only: no percentage, no reset time, no account.
+            var age = (int)(now - reading.CapturedAt).TotalMinutes;
+            var expired = ClaudeReader.HasExpiredWindow(reading.Windows, now) ? "expired-window" : "live-windows";
+            return $"desktop [{string.Join(", ", reading.Windows.Select(window => window.Id))}] "
+                + $"age {age}m, {expired}";
         }
         catch (Exception exception)
         {
-            this._output.WriteLine($"live: desktop step failed: {exception.GetType().Name}");
+            return $"none ({exception.GetType().Name})";
         }
+    }
 
-        // Step B: `claude /usage`.
+    private async Task<string> ProbeCliAsync(
+        string home, ClaudeProfile profile, IClaudeFileSystem fileSystem, IProcessRunner process)
+    {
         try
         {
-            if (ClaudeUsageCli.Locate(home, fileSystem) is { } binary)
+            if (ClaudeUsageCli.Locate(home, fileSystem) is not { } binary)
             {
-                var cli = new ClaudeUsageCli(
-                    binary, Path.Combine(Path.GetTempPath(), "quotadeck-claude-live-scratch"), process, fileSystem);
-                var reading = await cli.ReadWithPlanAsync(profile, DateTimeOffset.UtcNow, CancellationToken.None);
-                if (reading.Windows.Count > 0)
-                {
-                    return $"cli ({string.Join(", ", reading.Windows.Select(window => window.Id))})";
-                }
+                return "none (no binary found)";
             }
+
+            var cli = new ClaudeUsageCli(
+                binary, Path.Combine(Path.GetTempPath(), "quotadeck-claude-live-scratch"), process, fileSystem);
+            var reading = await cli.ReadWithPlanAsync(profile, DateTimeOffset.UtcNow, CancellationToken.None);
+            return reading.Windows.Count > 0
+                ? $"cli [{string.Join(", ", reading.Windows.Select(window => window.Id))}]"
+                : "none (no windows)";
         }
         catch (Exception exception)
         {
-            this._output.WriteLine($"live: cli step failed: {exception.GetType().Name}");
+            return $"none ({exception.GetType().Name})";
         }
+    }
 
-        // Step C: the keychain and the endpoint.
+    private async Task<string> ProbeEndpointAsync(
+        ClaudeProfile profile, IKeychain keychain, IProcessRunner process)
+    {
         try
         {
             var credentials = await new ClaudeKeychain(
-                profile.KeychainServices, profile.Account, keychain, process, TimeProvider.System)
-                .LoadAsync();
-            if (credentials.AccessToken.Length > 0)
+                profile.KeychainServices, profile.Account, keychain, process, TimeProvider.System).LoadAsync();
+            if (credentials.AccessToken.Length == 0)
             {
-                return "endpoint (a token was readable; the request itself is the reader's to make)";
+                return "none (empty token)";
             }
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(ClaudeReader.EndpointUrl));
+            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + credentials.AccessToken);
+            request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
+            using var response = await new HttpClientTransport().SendAsync(
+                request, TimeSpan.FromSeconds(15), CancellationToken.None);
+            if ((int)response.StatusCode != 200)
+            {
+                return $"none (HTTP {(int)response.StatusCode})";
+            }
+
+            var windows = ClaudeUsageResponse
+                .Decode(await response.Content.ReadAsStringAsync(CancellationToken.None))
+                .LimitWindows(DateTimeOffset.UtcNow);
+            return windows.Count > 0
+                ? $"endpoint [{string.Join(", ", windows.Select(window => window.Id))}]"
+                : "none (no windows)";
         }
         catch (Exception exception)
         {
-            this._output.WriteLine($"live: credential step failed: {exception.GetType().Name}/{exception.Message}");
+            return $"none ({exception.GetType().Name})";
         }
-
-        return "none";
     }
 }
 
