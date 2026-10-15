@@ -52,6 +52,26 @@
   </Target>
 
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <!-- Flatten native libraries next to the managed ones. NuGet lays them out under
+         runtimes/<rid>/native/, and a host that loads the plugin DLLs from this folder does not
+         probe that tree for DllImport'd libraries (SQLite's e_sqlite3 among them) — a plain .NET
+         host throws DllNotFoundException. Every native library for this platform is copied flat
+         next to QuotaDeckPlugin.dll; when a file name exists for both macOS RIDs, arm64 wins. The
+         runtimes/ tree stays in place. Keep this generic over file names: nothing here is specific
+         to e_sqlite3. -->
+    <ItemGroup Condition="$(OS) != 'Windows_NT'">
+      <FlattenNativeLib Include="$(OutputPath)runtimes\osx-arm64\native\*.dylib" />
+      <FlattenNativeLib Include="$(OutputPath)runtimes\osx-x64\native\*.dylib"
+                        Exclude="@(FlattenNativeLib->'$(OutputPath)runtimes\osx-x64\native\%(Filename)%(Extension)')" />
+    </ItemGroup>
+    <ItemGroup Condition="$(OS) == 'Windows_NT'">
+      <FlattenNativeLib Include="$(OutputPath)runtimes\win-x64\native\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(FlattenNativeLib)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true"
+          Condition="'@(FlattenNativeLib)' != ''" />
+    <Message Text="Flattened @(FlattenNativeLib->Count()) native library file(s) into $(OutputPath)"
+             Importance="High" Condition="'@(FlattenNativeLib)' != ''" />
+
     <!-- single-line link file: absolute forward-slash path of the folder that holds 'bin' and 'metadata' -->
     <Exec Condition="$(OS) == 'Windows_NT'" Command="echo $(BaseOutputPath)$(Configuration)\ &gt; &quot;$(PluginDir)\$(ProjectName).link&quot;" />
     <Exec Condition="$(OS) != 'Windows_NT'" Command="echo &quot;$(BaseOutputPath)$(Configuration)&quot; &gt; &quot;$(PluginDir)/$(ProjectName).link&quot;" />
