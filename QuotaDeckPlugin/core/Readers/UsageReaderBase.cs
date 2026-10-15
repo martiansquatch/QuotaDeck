@@ -95,7 +95,7 @@ public abstract class UsageReaderBase : IUsageReader
             }
             catch (Exception exception)
             {
-                return this.Degraded(Degradation.StatusFor(exception, now), now);
+                return this.Failed(exception, now);
             }
 
             var deadline = Task.Delay(this.FetchDeadline, this._time, cancellationToken);
@@ -115,7 +115,7 @@ public abstract class UsageReaderBase : IUsageReader
             }
             catch (Exception exception)
             {
-                return this.Degraded(Degradation.StatusFor(exception, now), now);
+                return this.Failed(exception, now);
             }
         }
         catch (Exception exception)
@@ -160,6 +160,16 @@ public abstract class UsageReaderBase : IUsageReader
             // An abandoned read's failure is not news: this fetch already reported TimedOut.
         }
     }
+
+    /// <summary>
+    /// What a failed read becomes. A <see cref="ReaderException"/> is the reader's own report and
+    /// goes through <see cref="OnFailure"/>, which is where a 429's hold-off is recorded; anything
+    /// else is a bug being reported and reads as its message.
+    /// </summary>
+    private ProviderSnapshot Failed(Exception exception, DateTimeOffset now) =>
+        exception is ReaderException readerException
+            ? this.OnFailure(readerException.Error, now)
+            : this.Degraded(Degradation.StatusFor(exception, now), now);
 
     private ProviderSnapshot OnFailure(ReaderError error, DateTimeOffset now)
     {
