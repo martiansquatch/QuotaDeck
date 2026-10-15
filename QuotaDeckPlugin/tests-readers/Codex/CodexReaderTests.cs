@@ -13,7 +13,9 @@ using QuotaDeck.Readers.Tests.Support;
 /// The reader behaviour of Codenotch <c>Sources/Providers/CodexLocalProvider.swift</c>
 /// (<c>fetchSnapshot()</c>, lines 40-104): the request contract, the HTTP mapping, the token being
 /// re-read on every fetch, the rate-limit floor, and the extras option. The URLProtocol stub cases
-/// of <c>Tests/CodexProfileTests.swift:243-272</c> run against <see cref="CodexEndpointStub"/>.
+/// of <c>Tests/CodexProfileTests.swift:243-272</c> are scripted on <see cref="FakeTransport"/> —
+/// responses by URL, headers (a <c>Retry-After</c> among them) on the response, and the request
+/// headers asserted through <c>Recorded</c>.
 /// </summary>
 public class CodexReaderTests
 {
@@ -57,23 +59,23 @@ public class CodexReaderTests
         Assert.Equal(clock.Now, snapshot.FetchedAt);
 
         // The usage request: the contract's headers and the 15 s budget.
-        var usage = transport.Requests[0];
-        Assert.Equal(UsageUrl, usage.RequestUri!.ToString());
-        Assert.Equal(HttpMethod.Get, usage.Method);
-        Assert.Equal("Bearer personal-token", usage.Headers.GetValues("Authorization").Single());
-        Assert.Equal("personal", usage.Headers.GetValues("ChatGPT-Account-Id").Single());
-        Assert.Equal("application/json", usage.Headers.GetValues("Accept").Single());
-        var cacheControl = string.Join(", ", usage.Headers.GetValues("Cache-Control"));
+        var usage = transport.Recorded[0];
+        Assert.Equal(UsageUrl, usage.Url);
+        Assert.Equal("GET", usage.Method);
+        Assert.Equal("Bearer personal-token", usage.Header("Authorization"));
+        Assert.Equal("personal", usage.Header("ChatGPT-Account-Id"));
+        Assert.Equal("application/json", usage.Header("Accept"));
+        var cacheControl = usage.Header("Cache-Control") ?? string.Empty;
         Assert.Contains("no-cache", cacheControl);
         Assert.Contains("no-store", cacheControl);
         Assert.Equal(TimeSpan.FromSeconds(15), transport.Timeouts[0]);
 
         // The reset-credits fetch is concurrent and carries its own beta header.
-        var credits = transport.Requests[1];
-        Assert.Equal(ResetCreditsUrl, credits.RequestUri!.ToString());
-        Assert.Equal("Bearer personal-token", credits.Headers.GetValues("Authorization").Single());
-        Assert.Equal("personal", credits.Headers.GetValues("ChatGPT-Account-Id").Single());
-        Assert.Equal("codex-1", credits.Headers.GetValues("OpenAI-Beta").Single());
+        var credits = transport.Recorded[1];
+        Assert.Equal(ResetCreditsUrl, credits.Url);
+        Assert.Equal("Bearer personal-token", credits.Header("Authorization"));
+        Assert.Equal("personal", credits.Header("ChatGPT-Account-Id"));
+        Assert.Equal("codex-1", credits.Header("OpenAI-Beta"));
     }
 
     [Fact]
@@ -139,8 +141,8 @@ public class CodexReaderTests
         using var home = new CodexTestHome();
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
 
-        var transport = new CodexScriptedTransport();
-        transport.Respond(HttpStatusCode.TooManyRequests, headers: ("Retry-After", "10"));
+        var transport = new FakeTransport();
+        transport.Respond(HttpStatusCode.TooManyRequests, "{}", "application/json", ("Retry-After", "10"));
         var store = new InMemoryReaderStateStore();
         var reader = Reader(home.Root, transport, store, new FakeClock(Now));
 
@@ -156,8 +158,8 @@ public class CodexReaderTests
         using var home = new CodexTestHome();
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
 
-        var transport = new CodexScriptedTransport();
-        transport.Respond(HttpStatusCode.TooManyRequests, headers: ("Retry-After", "300"));
+        var transport = new FakeTransport();
+        transport.Respond(HttpStatusCode.TooManyRequests, "{}", "application/json", ("Retry-After", "300"));
         var store = new InMemoryReaderStateStore();
         var reader = Reader(home.Root, transport, store, new FakeClock(Now));
 
@@ -172,10 +174,12 @@ public class CodexReaderTests
         using var home = new CodexTestHome();
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
 
-        var transport = new CodexScriptedTransport();
+        var transport = new FakeTransport();
         transport.Respond(
             HttpStatusCode.TooManyRequests,
-            headers: ("Retry-After", Now.AddSeconds(300).UtcDateTime.ToString("r")));
+            "{}",
+            "application/json",
+            ("Retry-After", Now.AddSeconds(300).UtcDateTime.ToString("r")));
         var store = new InMemoryReaderStateStore();
         var reader = Reader(home.Root, transport, store, new FakeClock(Now));
 
@@ -195,8 +199,8 @@ public class CodexReaderTests
         using var home = new CodexTestHome();
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
 
-        var transport = new CodexScriptedTransport();
-        transport.Respond(HttpStatusCode.TooManyRequests, headers: ("Retry-After", "300"));
+        var transport = new FakeTransport();
+        transport.Respond(HttpStatusCode.TooManyRequests, "{}", "application/json", ("Retry-After", "300"));
         transport.Respond(HttpStatusCode.OK, BothWindowsBody);
         transport.Respond(HttpStatusCode.OK, "{}");
         var store = new InMemoryReaderStateStore();
@@ -309,8 +313,16 @@ public class CodexReaderTests
         var profile = CodexProfile.Default(home.Root);
         CodexTestData.WriteAuth(profile, "work", token: "work-token");
 
-        var stub = new CodexEndpointStub();
-        var reader = Reader(home.Root, stub, new InMemoryReaderStateStore(), new FakeClock(Now));
+        var transport = new FakeTransport();
+        transport.Respond(
+            UsageUrl,
+            HttpStatusCode.OK,
+            """{"rate_limit":{"primary_window":{"used_percent":75,"limit_window_seconds":18000}}}""");
+        transport.Respond(
+            UsageUrl,
+            HttpStatusCode.OK,
+            """{"rate_limit":{"primary_window":{"used_percent":80,"limit_window_seconds":18000}}}""");
+        var reader = Reader(home.Root, transport, new InMemoryReaderStateStore(), new FakeClock(Now));
 
         var first = await reader.FetchAsync(Freshness.Standard);
         Assert.Equal(0.75, first.UsedFraction!.Value, precision: 4);
@@ -319,7 +331,10 @@ public class CodexReaderTests
         var rotated = await reader.FetchAsync(Freshness.Standard);
 
         Assert.Equal(0.80, rotated.UsedFraction!.Value, precision: 4);
-        Assert.Equal("Bearer rotated-token", stub.Requests[^2].Headers.GetValues("Authorization").Single());
+        var usage = transport.Recorded.Where(request => request.Url == UsageUrl).ToList();
+        Assert.Equal(2, usage.Count);
+        Assert.Equal("Bearer work-token", usage[0].Header("Authorization"));
+        Assert.Equal("Bearer rotated-token", usage[1].Header("Authorization"));
     }
 
     [Fact]
@@ -331,31 +346,44 @@ public class CodexReaderTests
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
         CodexTestData.WriteAuth(sibling, "work", token: "work-token");
 
-        var stub = new CodexEndpointStub();
-        var reader = Reader(home.Root, stub, new InMemoryReaderStateStore(), new FakeClock(Now));
+        var transport = new FakeTransport();
+        transport.Respond(
+            UsageUrl,
+            HttpStatusCode.OK,
+            """{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}""");
+        var reader = Reader(home.Root, transport, new InMemoryReaderStateStore(), new FakeClock(Now));
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
 
-        // 10% is personal; 75% would mean the work sibling's credential had leaked in.
+        // 10% is personal; work's 75% would mean the sibling's credential had leaked in.
         Assert.Equal(0.10, snapshot.UsedFraction!.Value, precision: 4);
         Assert.Equal("personal@example.test", snapshot.AccountLabel);
+        var usage = transport.Recorded.First(request => request.Url == UsageUrl);
+        Assert.Equal("Bearer personal-token", usage.Header("Authorization"));
+        Assert.Equal("personal", usage.Header("ChatGPT-Account-Id"));
     }
 
     [Fact]
-    public async Task ALimitedTokenBacksOffThroughTheEndpointStub()
+    public async Task ALimitedTokenBacksOffWithoutRetryingImmediately()
     {
         using var home = new CodexTestHome();
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "work", token: "limited-token");
 
-        var stub = new CodexEndpointStub();
+        var transport = new FakeTransport();
+        transport.Respond(
+            UsageUrl,
+            HttpStatusCode.TooManyRequests,
+            "{}",
+            "application/json",
+            ("Retry-After", "300"));
         var store = new InMemoryReaderStateStore();
-        var reader = Reader(home.Root, stub, store, new FakeClock(Now));
+        var reader = Reader(home.Root, transport, store, new FakeClock(Now));
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
 
         Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
         Assert.Equal(Now.AddSeconds(300), store.LoadBackoffUntil("codex"));
-        Assert.Single(stub.Requests);
+        Assert.Single(transport.Requests);
     }
 
     private static CodexReader Reader(
