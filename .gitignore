@@ -1,0 +1,19 @@
+# build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+*.swp
+.DS_Store
+
+# local plugin state (never commit runtime data)
+snapshots/
+*.lplug4
+*.link
+TestResults/
+
+# local-only notes and captures (may contain personal data)
+/local/
+*.local.json
