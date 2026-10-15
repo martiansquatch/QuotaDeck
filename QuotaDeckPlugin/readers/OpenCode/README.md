@@ -12,10 +12,10 @@ store open from `Sources/Providers/SQLiteStore.swift`, shared as
 - Routes: the Go key reads `https://opencode.ai/zen/go/v1/usage`; OAuth reads
   `https://opencode.ai/inference/go/v1/usage`; a 401 on OAuth is checked against the console's
   `/api/user` before it is called a sign-out.
-- Rate-limit wait: Codenotch's OpenCode caps the *whole* wait at 900 s including the server's
-  `Retry-After` (`min(900, max(doubled, hint))`); QuotaDeck's reader base deliberately applies
-  Claude's rule instead (the 60 s doubling is capped at 900 s; a larger server hint is honoured
-  as-is). A per-reader cap is coming in a separate plumbing PR.
+- Rate-limit wait: OpenCode pins `RateLimitBackoffStyle` to `RateLimitBackoff.LadderCapped` —
+  `min(900 s, max(60·2^min(n,4), hint))`, the whole wait including the server's `Retry-After`
+  inside the cap, matching `OpenCodeProvider.swift:206-211` (the default QuotaDeck ladder caps only
+  the doubling and honours a larger hint in full). The ladder still doubles per consecutive 429.
 - SQLite comes from Microsoft.Data.Sqlite's native folder
   (`runtimes/<rid>/native/libe_sqlite3.dylib`). Where the host cannot load it, the reader logs
   through `OpenCodeCredentials.Warning` and keeps reading `auth.json` only.

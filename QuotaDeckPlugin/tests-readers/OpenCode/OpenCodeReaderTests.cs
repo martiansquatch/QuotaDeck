@@ -314,8 +314,9 @@ public class OpenCodeReaderTests
     // ---- Rate limits. ----
 
     /// <summary>
-    /// The reader reports the server's hint raw; the base computes the wait (a minute doubling, the
-    /// hint as a floor) and persists the deadline, and the next fetch inside it spends nothing.
+    /// The reader reports the server's hint raw; the base computes the wait for OpenCode's capped
+    /// ladder (a minute doubling, the hint as a floor, the whole wait capped at fifteen minutes) and
+    /// persists the deadline, and the next fetch inside it spends nothing.
     /// </summary>
     [Fact]
     public async Task A429WithAHintRaisesTheFloorAndPersistsTheDeadline()
@@ -359,6 +360,73 @@ public class OpenCodeReaderTests
         await reader.FetchAsync(Freshness.FromSource);
 
         Assert.Equal(clock.Now.AddSeconds(60), store.LoadBackoffUntil("opencode"));
+    }
+
+    /// <summary>
+    /// OpenCode's own rule: the whole wait, the server's hint included, is capped at fifteen
+    /// minutes — an hour-long hint still parks the reader for 900 s. The default ladder would have
+    /// honoured the full hour.
+    /// </summary>
+    [Fact]
+    public async Task A429WithAnHourHintIsCappedAtFifteenMinutes()
+    {
+        using var directory = DirectoryWithGoKey();
+        var transport = new ScriptedTransport();
+        transport.Respond(HttpStatusCode.TooManyRequests, "{}", ("Retry-After", "3600"));
+        var clock = OpenCodeTestReader.DefaultClock;
+        var store = new InMemoryReaderStateStore();
+        var reader = new OpenCodeReader(ContextWith(transport, store, clock), directory.Path);
+
+        var snapshot = await reader.FetchAsync(Freshness.FromSource);
+
+        Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
+        Assert.Equal(clock.Now.AddSeconds(900), store.LoadBackoffUntil("opencode"));
+    }
+
+    /// <summary>
+    /// The capped ladder still doubles per consecutive 429: a minute, two, four.
+    /// </summary>
+    [Fact]
+    public async Task Consecutive429sClimbTheCappedLadder()
+    {
+        using var directory = DirectoryWithGoKey();
+        var transport = new ScriptedTransport();
+        var clock = OpenCodeTestReader.DefaultClock;
+        var store = new InMemoryReaderStateStore();
+        var reader = new OpenCodeReader(ContextWith(transport, store, clock), directory.Path);
+
+        foreach (var expected in new[] { 60, 120, 240 })
+        {
+            transport.Respond(HttpStatusCode.TooManyRequests, "{}");
+            await reader.FetchAsync(Freshness.FromSource);
+            Assert.Equal(clock.Now.AddSeconds(expected), store.LoadBackoffUntil("opencode"));
+
+            clock.Advance(expected + 1);
+        }
+
+        Assert.Equal(3, transport.Requests.Count);
+    }
+
+    /// <summary>A fresh reading is the end of the penalty: the persisted deadline is cleared.</summary>
+    [Fact]
+    public async Task ASuccessClearsTheHoldOff()
+    {
+        using var directory = DirectoryWithGoKey();
+        var transport = new ScriptedTransport();
+        transport.Respond(HttpStatusCode.TooManyRequests, "{}");
+        var clock = OpenCodeTestReader.DefaultClock;
+        var store = new InMemoryReaderStateStore();
+        var reader = new OpenCodeReader(ContextWith(transport, store, clock), directory.Path);
+
+        await reader.FetchAsync(Freshness.FromSource);
+        Assert.NotNull(store.LoadBackoffUntil("opencode"));
+
+        clock.Advance(61);
+        transport.Respond(HttpStatusCode.OK, OpenCodeTestReader.LivePayload);
+        var snapshot = await reader.FetchAsync(Freshness.FromSource);
+
+        Assert.Equal(ProviderStatusKind.Ok, snapshot.Status.Kind);
+        Assert.Null(store.LoadBackoffUntil("opencode"));
     }
 
     // ---- The module. ----
