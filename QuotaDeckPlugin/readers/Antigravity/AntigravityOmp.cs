@@ -2,7 +2,9 @@ namespace QuotaDeck.Readers.Antigravity;
 
 using System.Globalization;
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using QuotaDeck.Core.Model;
+using QuotaDeck.Readers.Shared;
 
 /// <summary>
 /// The OMP agent database: the account's token and, when it has one, its usage history.
@@ -13,9 +15,23 @@ using QuotaDeck.Core.Model;
 /// <c>provider = 'google-antigravity'</c>, one slot each for the Gemini and third-party hourly and
 /// weekly windows, newest row per slot, missing slots as 0.0 — always all four, because the
 /// standard four-window shape is what the face and the headline resolver expect.
+///
+/// The database is opened through the shared <see cref="SqliteReadOnly"/>, which is the one that
+/// reads a WAL store without littering sidecar files into another tool's state directory. One gap
+/// in that helper is filled here: its <c>Rows</c> takes no parameter, and the email filter must be
+/// bound rather than spliced into the SQL, so the filtered form runs the same kind of command on
+/// the connection the helper opened.
 /// </summary>
 public static class AntigravityOmp
 {
+    private const string UsageSql =
+        "SELECT limit_id, label, window_label, used_fraction, resets_at FROM usage_history " +
+        "WHERE provider = 'google-antigravity' ORDER BY recorded_at DESC, id DESC LIMIT 10;";
+
+    private const string UsageByEmailSql =
+        "SELECT limit_id, label, window_label, used_fraction, resets_at FROM usage_history " +
+        "WHERE provider = 'google-antigravity' AND email = ?1 ORDER BY recorded_at DESC, id DESC LIMIT 10;";
+
     public static string DatabasePath(string home) => Path.Combine(home, ".omp", "agent", "agent.db");
 
     public static AntigravityCredentials? Credentials(string home) =>
@@ -23,9 +39,11 @@ public static class AntigravityOmp
 
     public static AntigravityCredentials? CredentialsFromDatabase(string path)
     {
-        var rows = AntigravitySqlite.Query(
-            path,
-            "SELECT data FROM auth_credentials WHERE provider = 'google-antigravity' ORDER BY updated_at DESC LIMIT 1;");
+        using var connection = Open(path);
+        var rows = SqliteReadOnly.Rows(
+            connection,
+            "SELECT data FROM auth_credentials WHERE provider = 'google-antigravity' ORDER BY updated_at DESC LIMIT 1;",
+            columns: 1);
         if (rows.Count == 0 || rows[0][0] is not { Length: > 0 } data)
         {
             return null;
@@ -56,8 +74,8 @@ public static class AntigravityOmp
 
     public static IReadOnlyList<LimitWindow> UsageWindows(string home, string? email)
     {
-        var path = DatabasePath(home);
-        if (!File.Exists(path))
+        using var connection = Open(DatabasePath(home));
+        if (connection is null)
         {
             return [];
         }
@@ -65,19 +83,14 @@ public static class AntigravityOmp
         var target = email;
         if (string.IsNullOrEmpty(target))
         {
-            var latest = AntigravitySqlite.Query(
-                path,
+            var latest = SqliteReadOnly.Column(
+                connection,
                 "SELECT email FROM usage_history WHERE provider = 'google-antigravity' AND email IS NOT NULL AND email != '' ORDER BY recorded_at DESC, id DESC LIMIT 1;");
-            target = latest.Count > 0 ? latest[0][0] : null;
+            target = latest.Count > 0 ? latest[0] : null;
         }
 
         var withEmail = !string.IsNullOrEmpty(target);
-        var rows = AntigravitySqlite.Query(
-            path,
-            withEmail
-                ? "SELECT limit_id, label, window_label, used_fraction, resets_at FROM usage_history WHERE provider = 'google-antigravity' AND email = @p0 ORDER BY recorded_at DESC, id DESC LIMIT 10;"
-                : "SELECT limit_id, label, window_label, used_fraction, resets_at FROM usage_history WHERE provider = 'google-antigravity' ORDER BY recorded_at DESC, id DESC LIMIT 10;",
-            withEmail ? [target] : null);
+        var rows = ReadUsageRows(connection, withEmail ? target : null);
 
         var newestBySlot = new Dictionary<string, (string Group, string Label, double Used, DateTimeOffset? Resets)>(StringComparer.Ordinal);
         foreach (var row in rows)
@@ -131,6 +144,83 @@ public static class AntigravityOmp
         }
 
         return windows;
+    }
+
+    /// <summary>
+    /// The shared opener, with the host-layout failure it documents turned into "unreadable": the
+    /// native library can fail to load from a plugin host whose probing layout misses it, and an
+    /// unreadable store is a state this reader already handles — not a failed fetch.
+    /// </summary>
+    private static SqliteConnection? Open(string path)
+    {
+        try
+        {
+            return SqliteReadOnly.Open(path);
+        }
+        catch (Exception exception) when (MissingNativeLibrary(exception))
+        {
+            return null;
+        }
+    }
+
+    private static bool MissingNativeLibrary(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is DllNotFoundException)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The usage query, with the email bound to <c>?1</c> when one is in hand. The shared
+    /// <c>Rows</c> takes no parameter and the email must not be spliced into the SQL, so this one
+    /// statement is run on the connection the shared helper opened; values come back as text in the
+    /// same shape (SQL NULL as null).
+    /// </summary>
+    private static IReadOnlyList<string?[]> ReadUsageRows(SqliteConnection connection, string? email)
+    {
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = email is null ? UsageSql : UsageByEmailSql;
+            if (email is not null)
+            {
+                command.Parameters.AddWithValue("?1", email);
+            }
+
+            using var reader = command.ExecuteReader();
+
+            var rows = new List<string?[]>();
+            while (reader.Read())
+            {
+                var row = new string?[reader.FieldCount];
+                for (var index = 0; index < reader.FieldCount; index++)
+                {
+                    row[index] = reader.IsDBNull(index)
+                        ? null
+                        : reader.GetValue(index) switch
+                        {
+                            string text => text,
+                            IFormattable value => value.ToString(null, CultureInfo.InvariantCulture),
+                            { } value => value.ToString(),
+                        };
+                }
+
+                rows.Add(row);
+            }
+
+            return rows;
+        }
+        catch (SqliteException)
+        {
+            // A statement a schema cannot prepare answers an empty set, like the shared helper.
+            return [];
+        }
     }
 
     private static double? ParseNumber(string? text) =>

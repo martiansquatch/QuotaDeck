@@ -2,11 +2,13 @@ namespace QuotaDeck.Readers.Tests.Antigravity;
 
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using QuotaDeck.Core.Model;
 using QuotaDeck.Core.Policy;
 using QuotaDeck.Core.Readers;
 using QuotaDeck.Core.Settings;
 using QuotaDeck.Readers.Antigravity;
+using QuotaDeck.Readers.Tests.Claude;
 using QuotaDeck.Readers.Tests.Support;
 
 /// <summary>
@@ -37,7 +39,8 @@ public class AntigravityReaderTests
         string data,
         RecordingTransport? transport = null,
         FakeClock? clock = null,
-        Func<CancellationToken, Task<IReadOnlyList<LimitWindow>?>>? localQuota = null) => new()
+        Func<CancellationToken, Task<IReadOnlyList<LimitWindow>?>>? localQuota = null,
+        FakeKeychain? keychain = null) => new()
     {
         Profile = AntigravityProfile.Default(home),
         HomeDirectory = home,
@@ -47,6 +50,7 @@ public class AntigravityReaderTests
         TimeProvider = clock ?? new FakeClock(Now),
         Loopback = transport ?? new RecordingTransport(),
         LocalQuotaOverride = localQuota,
+        Keychain = keychain ?? new FakeKeychain(),
         ServerPollAttempts = 2,
         ServerPollInterval = TimeSpan.FromMilliseconds(1),
     };
@@ -106,10 +110,11 @@ public class AntigravityReaderTests
     {
         var runner = new QueueingProcessRunner();
         runner.Respond("/bin/ps", 0, "1 /sbin/launchd\n");
-        runner.Respond("/usr/bin/security", 0, KeychainPayload("cloud-token", DateTimeOffset.UtcNow.AddHours(2)));
+        var keychain = new FakeKeychain();
+        AddKeychainCredential(keychain, "cloud-token", Now.AddHours(2));
         var transport = new RecordingTransport();
         transport.Respond(HttpStatusCode.OK, QuotaBody);
-        using var reader = Reader(Options(runner, NewDirectory("qd-ag-home"), NewDirectory("qd-ag-data"), transport));
+        using var reader = Reader(Options(runner, NewDirectory("qd-ag-home"), NewDirectory("qd-ag-data"), transport, keychain: keychain));
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
 
@@ -134,7 +139,6 @@ public class AntigravityReaderTests
             $$"""{"access_token":"json-token","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}},"email":"user@example.com","project_id":"example-project"}""");
         var runner = new QueueingProcessRunner();
         runner.Respond("/bin/ps", 0, "1 /sbin/launchd\n");
-        runner.Respond("/usr/bin/security", 1, "");
         var transport = new RecordingTransport();
         transport.Respond(HttpStatusCode.OK, QuotaBody);
         using var reader = Reader(Options(runner, home, NewDirectory("qd-ag-data"), transport));
@@ -142,6 +146,36 @@ public class AntigravityReaderTests
         await reader.FetchAsync(Freshness.Standard);
 
         Assert.Equal("{\"project\":\"example-project\"}", transport.Requests.Single().Body);
+    }
+
+    /// <summary>
+    /// A project id is another app's string: quotes and backslashes in it must not break the body,
+    /// which is built by the JSON serialiser rather than by interpolation.
+    /// </summary>
+    [Fact]
+    public async Task TheCloudCallEscapesAProjectIdWithQuotes()
+    {
+        var home = NewDirectory("qd-ag-home");
+        var project = "pro\"ject\\1";
+        Directory.CreateDirectory(Path.Combine(home, ".gemini", "antigravity"));
+        File.WriteAllText(
+            Path.Combine(home, ".gemini", "antigravity", "oauth_creds.json"),
+            JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["access_token"] = "json-token",
+                ["expiry_date"] = Now.AddHours(1).ToUnixTimeMilliseconds(),
+                ["projectId"] = project,
+            }));
+        var runner = new QueueingProcessRunner();
+        runner.Respond("/bin/ps", 0, "1 /sbin/launchd\n");
+        var transport = new RecordingTransport();
+        transport.Respond(HttpStatusCode.OK, QuotaBody);
+        using var reader = Reader(Options(runner, home, NewDirectory("qd-ag-data"), transport));
+
+        await reader.FetchAsync(Freshness.Standard);
+
+        using var body = JsonDocument.Parse(transport.Requests.Single().Body!);
+        Assert.Equal(project, body.RootElement.GetProperty("project").GetString());
     }
 
     /// <summary>The OMP history answers when the cloud refuses, without a credential at all.</summary>
@@ -152,7 +186,6 @@ public class AntigravityReaderTests
         WriteOmpUsageHistory(home);
         var runner = new QueueingProcessRunner();
         runner.Respond("/bin/ps", 0, "1 /sbin/launchd\n");
-        runner.Respond("/usr/bin/security", 1, "");
         var transport = new RecordingTransport();
         using var reader = Reader(Options(runner, home, NewDirectory("qd-ag-data"), transport));
 
@@ -179,7 +212,6 @@ public class AntigravityReaderTests
             $$"""{"created_at":"{{Now.AddHours(-2).ToUniversalTime():o}}","source":"MODEL","type":"PLANNER_RESPONSE"}""");
         var runner = new QueueingProcessRunner();
         runner.Respond("/bin/ps", 0, "1 /sbin/launchd\n");
-        runner.Respond("/usr/bin/security", 1, "");
         using var reader = Reader(Options(runner, home, NewDirectory("qd-ag-data")));
 
         var snapshot = await reader.FetchAsync(Freshness.Standard);
@@ -213,25 +245,56 @@ public class AntigravityReaderTests
         Assert.False(request.Request.Headers.Contains("x-codeium-csrf-token"));
     }
 
-    /// <summary>The bridged flag is persisted, so a restart still knows the server once answered.</summary>
+    /// <summary>
+    /// The bridged flag is persisted, so a restart still knows the server once answered — while an
+    /// installed IDE or CLI makes it possible for the flag to become true again.
+    /// </summary>
     [Fact]
     public async Task TheBridgedFlagSurvivesARestart()
     {
         var home = NewDirectory("qd-ag-home");
         var data = NewDirectory("qd-ag-data");
+        var apps = InstalledIde();
         var windows = new List<LimitWindow> { Window("gemini-weekly", 0.2, "Weekly Limit", TimeSpan.FromDays(7)) };
-        using (var first = Reader(Options(new QueueingProcessRunner(), home, data, localQuota: _ => Task.FromResult<IReadOnlyList<LimitWindow>?>(windows))))
+        var firstOptions = Options(new QueueingProcessRunner(), home, data, localQuota: _ => Task.FromResult<IReadOnlyList<LimitWindow>?>(windows))
+            with { Applications = [apps], PathEnvironment = "" };
+        using (var first = Reader(firstOptions))
         {
             await first.FetchAsync(Freshness.Standard);
         }
 
         Assert.True(File.Exists(Path.Combine(data, "antigravity-bridged")));
 
-        using var restarted = Reader(Options(new QueueingProcessRunner(), home, data, localQuota: _ => Task.FromResult<IReadOnlyList<LimitWindow>?>(null)));
+        var restartedOptions = Options(new QueueingProcessRunner(), home, data, localQuota: _ => Task.FromResult<IReadOnlyList<LimitWindow>?>(null))
+            with { Applications = [apps], PathEnvironment = "" };
+        using var restarted = Reader(restartedOptions);
         var snapshot = await restarted.FetchAsync(Freshness.Standard);
 
         Assert.Equal(ProviderStatusKind.Stale, snapshot.Status.Kind);
         Assert.Empty(snapshot.Windows);
+    }
+
+    /// <summary>
+    /// Codenotch's <c>everBridged</c> is per launch. The persisted flag only counts while the IDE
+    /// binary or <c>agy</c> is still installed: with neither present it cannot become true again,
+    /// so it is ignored, deleted, and the request count — not a stale percentage — is the answer.
+    /// </summary>
+    [Fact]
+    public async Task TheBridgedFlagIsIgnoredWhenTheIdeIsGone()
+    {
+        var home = NewDirectory("qd-ag-home");
+        var data = NewDirectory("qd-ag-data");
+        File.WriteAllText(Path.Combine(data, AntigravityReader.BridgedFlagFileName), "1");
+        var runner = new QueueingProcessRunner();
+        runner.Respond("/bin/ps", 0, "1 /sbin/launchd\n");
+        var options = Options(runner, home, data) with { Applications = [], PathEnvironment = "" };
+        using var reader = Reader(options);
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal("requests", reader.LastSource);
+        Assert.Equal(Fidelity.Derived, snapshot.Fidelity);
+        Assert.False(File.Exists(Path.Combine(data, AntigravityReader.BridgedFlagFileName)));
     }
 
     // MARK: - Headline and weekly selection
@@ -353,6 +416,30 @@ public class AntigravityReaderTests
     {
         var json = "{\"auth_method\":\"consumer\",\"token\":{\"access_token\":\"" + token + "\",\"expiry\":\"" + expiry.ToString("o") + "\"}}";
         return "go-keyring-base64:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+    }
+
+    /// <summary>One <c>gemini</c>/<c>antigravity</c> item holding an unexpired credential envelope.</summary>
+    private static void AddKeychainCredential(FakeKeychain keychain, string token, DateTimeOffset expiry) =>
+        keychain.Add(
+            AntigravityCredentialStore.KeychainService,
+            Encoding.UTF8.GetBytes(KeychainPayload(token, expiry)),
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            AntigravityCredentialStore.KeychainAccount);
+
+    /// <summary>A temp Applications directory holding an executable Antigravity bundle.</summary>
+    private static string InstalledIde()
+    {
+        var apps = NewDirectory("qd-ag-apps");
+        var bin = Path.Combine(apps, "Antigravity.app", "Contents", "Resources", "bin");
+        Directory.CreateDirectory(bin);
+        var binary = Path.Combine(bin, "language_server");
+        File.WriteAllText(binary, "#!/bin/sh\n");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(binary, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        return apps;
     }
 
     private static void WriteOmpUsageHistory(string home)

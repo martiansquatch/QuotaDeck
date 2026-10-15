@@ -57,13 +57,21 @@ public static class AntigravityBridge
         var lines = processTable.Split('\n');
 
         // The IDE's language server, which is the one that carries a token.
-        var ide = lines.FirstOrDefault(line =>
-            line.Contains("language_server", StringComparison.Ordinal)
-            && line.Contains("--csrf_token", StringComparison.Ordinal));
-        if (ide is not null
-            && ValueOf("--csrf_token", ide) is { } token
-            && Pid(ide) is { } idePid)
+        //
+        // Swift stops at the first line matching both substrings; here every candidate is tried
+        // until one has listening ports. A deliberate robustness difference: the first match can be
+        // a process that never bound (a server this reader itself started, or one mid-shutdown)
+        // while the next one is answering, and a candidate without ports costs only its lsof call.
+        foreach (var line in lines)
         {
+            if (!line.Contains("language_server", StringComparison.Ordinal)
+                || !line.Contains("--csrf_token", StringComparison.Ordinal)
+                || ValueOf("--csrf_token", line) is not { } token
+                || Pid(line) is not { } idePid)
+            {
+                continue;
+            }
+
             var ports = await listeningPorts(idePid, cancellationToken).ConfigureAwait(false);
             if (ports.Count > 0)
             {
@@ -72,9 +80,13 @@ public static class AntigravityBridge
         }
 
         // Then the CLI, which serves the same RPC to anything on loopback.
-        var cli = lines.FirstOrDefault(IsCli);
-        if (cli is not null && Pid(cli) is { } cliPid)
+        foreach (var line in lines)
         {
+            if (!IsCli(line) || Pid(line) is not { } cliPid)
+            {
+                continue;
+            }
+
             var ports = await listeningPorts(cliPid, cancellationToken).ConfigureAwait(false);
             if (ports.Count > 0)
             {

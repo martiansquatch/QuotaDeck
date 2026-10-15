@@ -138,4 +138,27 @@ public class AntigravityOmpTests
 
         Assert.Equal(0.17, windows.Single(window => window.Id == "gemini-hourly").UsedFraction!.Value, 4);
     }
+
+    /// <summary>
+    /// Reading the OMP store must leave no sidecar files beside it: the store belongs to another
+    /// tool, and `-wal`/`-shm`/`-journal` files are writes into its directory.
+    /// </summary>
+    [Fact]
+    public void OpeningTheOmpDatabaseCreatesNoSidecarFiles()
+    {
+        var home = NewHome();
+        CreateDatabase(home, withRows: true);
+        var directory = Path.GetDirectoryName(AntigravityOmp.DatabasePath(home))!;
+        var before = Directory.GetFiles(directory).OrderBy(path => path).ToList();
+
+        AntigravityOmp.UsageWindows(home, "user@example.com");
+        AntigravityOmp.Credentials(home);
+
+        var after = Directory.GetFiles(directory).OrderBy(path => path).ToList();
+        Assert.Equal(before, after);
+        Assert.DoesNotContain(after, path =>
+            path.EndsWith("-wal", StringComparison.Ordinal)
+            || path.EndsWith("-shm", StringComparison.Ordinal)
+            || path.EndsWith("-journal", StringComparison.Ordinal));
+    }
 }

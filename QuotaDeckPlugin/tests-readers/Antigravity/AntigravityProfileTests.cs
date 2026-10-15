@@ -37,24 +37,26 @@ public class AntigravityProfileTests
     [Fact]
     public void DefaultIdentityAndPathsStayCompatible()
     {
-        var profile = AntigravityProfile.Default("/Users/test");
+        var home = NewHome();
+        var profile = AntigravityProfile.Default(home);
 
         Assert.Null(profile.Slug);
         Assert.Equal("antigravity", profile.Id);
         Assert.Equal("Antigravity", profile.DisplayName);
-        Assert.Equal("/Users/test/.gemini/antigravity", profile.ConfigDirectory);
-        Assert.Equal("/Users/test/.gemini/antigravity/oauth_creds.json", profile.AuthPath);
-        Assert.Equal("/Users/test/.gemini/antigravity/brain", profile.BrainDirectory);
+        Assert.Equal(Path.Combine(home, ".gemini", "antigravity"), profile.ConfigDirectory);
+        Assert.Equal(Path.Combine(home, ".gemini", "antigravity", "oauth_creds.json"), profile.AuthPath);
+        Assert.Equal(Path.Combine(home, ".gemini", "antigravity", "brain"), profile.BrainDirectory);
     }
 
     [Fact]
     public void NamedProfileIdentityAndPaths()
     {
-        var profile = new AntigravityProfile("work", "/Users/test/.gemini/antigravity-work");
+        var home = NewHome();
+        var profile = new AntigravityProfile("work", Path.Combine(home, ".gemini", "antigravity-work"));
 
         Assert.Equal("antigravity-work", profile.Id);
         Assert.Equal("Antigravity (work)", profile.DisplayName);
-        Assert.Equal("/Users/test/.gemini/antigravity-work/oauth_creds.json", profile.AuthPath);
+        Assert.Equal(Path.Combine(home, ".gemini", "antigravity-work", "oauth_creds.json"), profile.AuthPath);
     }
 
     [Fact]

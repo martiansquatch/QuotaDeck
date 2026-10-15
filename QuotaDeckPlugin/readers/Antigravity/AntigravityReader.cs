@@ -1,5 +1,6 @@
 namespace QuotaDeck.Readers.Antigravity;
 
+using System.Text.Json;
 using QuotaDeck.Core.Model;
 using QuotaDeck.Core.Policy;
 using QuotaDeck.Core.Readers;
@@ -211,7 +212,7 @@ public sealed class AntigravityReader : UsageReaderBase, IDisposable
                 "Client-Metadata",
                 "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI");
             request.Content = new StringContent(
-                credentials.ProjectId is { Length: > 0 } project ? $"{{\"project\":\"{project}\"}}" : "{}",
+                CloudRequestBody(credentials.ProjectId),
                 System.Text.Encoding.UTF8,
                 "application/json");
 
@@ -246,6 +247,17 @@ public sealed class AntigravityReader : UsageReaderBase, IDisposable
         HeadlineId = ResolveHeadlineId(windows, this._options.HeadlineModel, this._options.HeadlineLimit),
         WeeklyId = ResolveWeeklyId(windows, this._options.HeadlineModel),
     };
+
+    /// <summary>
+    /// The direct call's JSON body: <c>{"project":"…"}</c> when the credential names one, <c>{}</c>
+    /// otherwise — Swift's exact shape. Built with <see cref="JsonSerializer"/> rather than
+    /// interpolation because a project id is another app's string and may contain quotes,
+    /// backslashes or anything else JSON must escape.
+    /// </summary>
+    public static string CloudRequestBody(string? projectId) =>
+        projectId is { Length: > 0 }
+            ? JsonSerializer.Serialize(new Dictionary<string, string> { ["project"] = projectId })
+            : "{}";
 
     /// <summary>
     /// Which window leads the face. Port of <c>resolveHeadlineID(for:)</c>: candidates are the
@@ -324,14 +336,69 @@ public sealed class AntigravityReader : UsageReaderBase, IDisposable
             return false;
         }
 
+        var flag = Path.Combine(this._options.DataDirectory, BridgedFlagFileName);
+        bool present;
         try
         {
-            return File.Exists(Path.Combine(this._options.DataDirectory, BridgedFlagFileName));
+            present = File.Exists(flag);
         }
         catch
         {
             return false;
         }
+
+        if (!present)
+        {
+            return false;
+        }
+
+        // Codenotch's `everBridged` dies with the launch; the persisted flag stands in for it
+        // across restarts, but only while something that could have bridged is still installed.
+        // With neither the IDE's language-server binary nor `agy` on the machine the flag describes
+        // a source that cannot come back, so it is deleted and the request count — not a stale
+        // percentage — is the honest answer.
+        if (AntigravityBridge.ServerBinary(this._options.ApplicationDirectories) is null
+            && !AgyOnPath(this._options.EffectivePath))
+        {
+            try
+            {
+                File.Delete(flag);
+            }
+            catch
+            {
+                // An undeletable flag is ignored this launch and re-checked the next.
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>`agy` on PATH, the way the module's presence probe looks for it.</summary>
+    private static bool AgyOnPath(string? path)
+    {
+        if (path is null)
+        {
+            return false;
+        }
+
+        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                if (File.Exists(Path.Combine(directory, "agy")))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // An unreadable PATH entry is simply not one.
+            }
+        }
+
+        return false;
     }
 
     private void SetBridged()

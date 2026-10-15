@@ -71,13 +71,44 @@ public class AntigravityBridgeTests
     [Fact]
     public async Task TheCliIsFoundByItsFullPathToo()
     {
+        var cli = Path.Combine(Path.GetTempPath(), "qd-agy-" + Guid.NewGuid().ToString("N"), ".local", "bin", "agy");
         var endpoint = await AntigravityBridge.DiscoverAsync(
-            "700 /Users/someone/.local/bin/agy",
+            $"700 {cli}",
             (_, _) => Task.FromResult<IReadOnlyList<int>>([9000]),
             CancellationToken.None);
 
         Assert.NotNull(endpoint);
         Assert.Null(endpoint!.CsrfToken);
+    }
+
+    /// <summary>
+    /// Swift stops at the first <c>ps</c> line matching both substrings; this reader iterates
+    /// candidates until one has listening ports — a deliberate robustness difference, because the
+    /// first match can be a process that never bound while the next one is answering.
+    /// </summary>
+    [Fact]
+    public async Task ACandidateWithoutPortsDoesNotHideTheNext()
+    {
+        var first =
+            "1111 /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone " +
+            "--csrf_token aaaa --app_data_dir quotadeck-bridge";
+        var second =
+            "2222 /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone " +
+            "--csrf_token bbbb --app_data_dir antigravity";
+        var asked = new List<int>();
+
+        var endpoint = await AntigravityBridge.DiscoverAsync(
+            first + "\n" + second,
+            (pid, _) =>
+            {
+                asked.Add(pid);
+                return Task.FromResult<IReadOnlyList<int>>(pid == 2222 ? [63881] : []);
+            },
+            CancellationToken.None);
+
+        Assert.NotNull(endpoint);
+        Assert.Equal("bbbb", endpoint!.CsrfToken);
+        Assert.Equal(new[] { 1111, 2222 }, asked);
     }
 
     [Fact]
@@ -163,6 +194,11 @@ public class AntigravityBridgeTests
         ServerPollInterval = TimeSpan.FromMilliseconds(1),
     };
 
+    /// <summary>A `ps -p` answer describing the server this reader starts.</summary>
+    private static string OurCommandLine(int pid) =>
+        $"{pid} /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone "
+        + "--csrf_token 11111111-2222-4333-8444-555555555555 --app_data_dir quotadeck-bridge\n";
+
     [Fact]
     public async Task StartingOneBuildsTheServerAndPollsLsof()
     {
@@ -209,21 +245,60 @@ public class AntigravityBridgeTests
         Assert.Equal(1, runner.Count("/bin/sh"));
     }
 
+    /// <summary>
+    /// A server that has not bound within the polling budget is kept and re-polled on the next
+    /// fetch — Swift's <c>Owned</c> holds the started process and its empty-ports endpoint while it
+    /// runs, and <c>resolveEndpoint()</c> calls <c>listeningPorts(ofPID:)</c> again — so a second
+    /// server is never started for the same reader.
+    /// </summary>
     [Fact]
-    public async Task AServerThatNeverBindsIsNotRemembered()
+    public async Task AServerThatNeverBindsIsKeptAndRepolled()
     {
         var runner = new QueueingProcessRunner();
         runner.Respond("/bin/sh", 0, "4242\n");
-        for (var attempt = 0; attempt < 4; attempt++)
-        {
-            runner.Respond("/usr/sbin/lsof", 0, string.Empty);
-        }
-
+        runner.Respond("/usr/sbin/lsof", 0, string.Empty);
+        runner.Respond("/usr/sbin/lsof", 0, string.Empty);
+        runner.Respond("/bin/ps", 0, OurCommandLine(4242));
+        runner.Respond("/usr/sbin/lsof", 0, LsofOutput);
         var server = new AntigravityServer(Options(runner, attempts: 2));
-        var endpoint = await server.EndpointOrStartAsync(CancellationToken.None);
 
-        Assert.Null(endpoint);
+        var first = await server.EndpointOrStartAsync(CancellationToken.None);
+
+        Assert.Null(first);
+        Assert.Equal(4242, server.Pid);
         Assert.Null(server.Current);
+        Assert.Equal(1, runner.Count("/bin/sh"));
+
+        var second = await server.EndpointOrStartAsync(CancellationToken.None);
+
+        Assert.NotNull(second);
+        Assert.Equal(new[] { 63881, 63882 }, second!.Ports);
+        Assert.Equal(1, runner.Count("/bin/sh"));
+        var start = runner.Requests.First(request => request.FileName == "/bin/sh");
+        Assert.NotNull(second.CsrfToken);
+        Assert.Contains(second.CsrfToken!, start.Arguments[1], StringComparison.Ordinal);
+    }
+
+    /// <summary>A server that crashed is forgotten, so a later fetch can start a replacement.</summary>
+    [Fact]
+    public async Task ADeadServerIsReplacedOnTheNextFetch()
+    {
+        var runner = new QueueingProcessRunner();
+        runner.Respond("/bin/sh", 0, "4242\n");
+        runner.Respond("/usr/sbin/lsof", 0, string.Empty);
+        runner.Respond("/usr/sbin/lsof", 0, string.Empty);
+        runner.Respond("/bin/ps", 1, string.Empty);
+        runner.Respond("/bin/sh", 0, "5150\n");
+        runner.Respond("/usr/sbin/lsof", 0, LsofOutput);
+        var server = new AntigravityServer(Options(runner, attempts: 2));
+
+        Assert.Null(await server.EndpointOrStartAsync(CancellationToken.None));
+
+        var replacement = await server.EndpointOrStartAsync(CancellationToken.None);
+
+        Assert.NotNull(replacement);
+        Assert.Equal(5150, server.Pid);
+        Assert.Equal(2, runner.Count("/bin/sh"));
     }
 
     [Fact]
@@ -232,14 +307,54 @@ public class AntigravityBridgeTests
         var runner = new QueueingProcessRunner();
         runner.Respond("/bin/sh", 0, "4242\n");
         runner.Respond("/usr/sbin/lsof", 0, LsofOutput);
+        runner.Respond("/bin/ps", 0, OurCommandLine(4242));
         var server = new AntigravityServer(Options(runner));
         await server.EndpointOrStartAsync(CancellationToken.None);
 
         server.Stop();
 
+        var probe = runner.Requests.Single(request => request.FileName == "/bin/ps");
+        Assert.Equal(new[] { "-p", "4242", "-o", "command=" }, probe.Arguments);
         var kill = runner.Requests.Single(request => request.FileName == "/bin/kill");
         Assert.Equal(new[] { "-TERM", "4242" }, kill.Arguments);
         Assert.Null(server.Current);
+        Assert.Null(server.Pid);
+    }
+
+    /// <summary>
+    /// The number may have been handed to a stranger between the server's death and the disposal;
+    /// without the marker on its command line it is not signalled.
+    /// </summary>
+    [Fact]
+    public async Task StopDoesNotSignalAReusedPid()
+    {
+        var runner = new QueueingProcessRunner();
+        runner.Respond("/bin/sh", 0, "4242\n");
+        runner.Respond("/usr/sbin/lsof", 0, LsofOutput);
+        runner.Respond("/bin/ps", 0, "4242 /usr/bin/unrelated --flag\n");
+        var server = new AntigravityServer(Options(runner));
+        await server.EndpointOrStartAsync(CancellationToken.None);
+
+        server.Stop();
+
+        Assert.DoesNotContain(runner.Requests, request => request.FileName == "/bin/kill");
+        Assert.Null(server.Current);
+    }
+
+    /// <summary>A pid that is already gone has nothing to signal.</summary>
+    [Fact]
+    public async Task StopDoesNotSignalAVanishedPid()
+    {
+        var runner = new QueueingProcessRunner();
+        runner.Respond("/bin/sh", 0, "4242\n");
+        runner.Respond("/usr/sbin/lsof", 0, LsofOutput);
+        runner.Respond("/bin/ps", 1, string.Empty);
+        var server = new AntigravityServer(Options(runner));
+        await server.EndpointOrStartAsync(CancellationToken.None);
+
+        server.Stop();
+
+        Assert.DoesNotContain(runner.Requests, request => request.FileName == "/bin/kill");
     }
 
     [Fact]
