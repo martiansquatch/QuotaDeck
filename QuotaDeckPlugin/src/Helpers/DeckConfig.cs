@@ -5,6 +5,7 @@ namespace Loupedeck.QuotaDeckPlugin
     using System.Runtime.InteropServices;
     using System.Text.Json;
     using System.Text.Json.Serialization;
+    using QuotaDeck.Core.Settings;
 
     /// <summary>
     /// QuotaDeck settings, kept in a per-user data directory:
@@ -13,8 +14,12 @@ namespace Loupedeck.QuotaDeckPlugin
     ///   other:   $XDG_DATA_HOME/QuotaDeck, or ~/.local/share/QuotaDeck
     /// The file is config.json; comments and trailing commas are tolerated, and it is rewritten on load
     /// so keys added by newer versions appear with their defaults.
+    ///
+    /// The core settings (showRemaining, watchLimit, criticalLimit, providers, order) are
+    /// <see cref="QuotaDeckSettings"/> itself, carried as flat keys beside debugSnapshots; the
+    /// watch/critical pair is repaired on load by <see cref="QuotaDeckSettings.Normalize"/>.
     /// </summary>
-    public sealed class DeckConfig
+    public sealed class DeckConfig : QuotaDeckSettings
     {
         /// <summary>
         /// Write every rendered key face to snapshots/&lt;key&gt;_&lt;size&gt;.png and enable the trigger.txt
@@ -70,14 +75,16 @@ namespace Loupedeck.QuotaDeckPlugin
                 if (File.Exists(ConfigFile))
                 {
                     Current = JsonSerializer.Deserialize<DeckConfig>(File.ReadAllText(ConfigFile), JsonOptions) ?? new DeckConfig();
-                    // Persist any keys added since the file was written (e.g. new defaults in later phases).
-                    File.WriteAllText(ConfigFile, JsonSerializer.Serialize(Current, JsonOptions));
                 }
                 else
                 {
                     Current = new DeckConfig();
-                    File.WriteAllText(ConfigFile, JsonSerializer.Serialize(Current, JsonOptions));
                 }
+
+                // Repair a hand-edited or crossed-over threshold pair before anything reads it, then
+                // persist any keys added since the file was written (e.g. new defaults in later phases).
+                Current.Normalize();
+                File.WriteAllText(ConfigFile, JsonSerializer.Serialize(Current, JsonOptions));
             }
             catch (Exception ex)
             {

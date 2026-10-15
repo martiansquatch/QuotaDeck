@@ -3,8 +3,10 @@
 C# plugin for the Logi Actions SDK that renders QuotaDeck's provider quota faces on the nine 118 px
 LCD keys of the Logitech MX Creative Keypad.
 
-**Status: Phase 1 ("hello deck").** One static sample face, a headless snapshot harness, and the
-full-panel pulse — no provider readers yet.
+**Status: Phase 2 ("state engine").** The provider-agnostic engine — snapshot model, status and
+degradation semantics, reader contract, thresholds, remaining/used toggle, refresh and backoff
+policy, settings — lives in `core/` with its xunit suite in `tests/`. The plugin references it and
+`config.json` carries its settings. No provider readers yet: the sample face stands in for them.
 
 ## Requirements
 
@@ -48,13 +50,28 @@ killall LogiPluginService
 | Snapshots | `$HOME/Library/Application Support/QuotaDeck/snapshots/` |
 | Trigger file | `$HOME/Library/Application Support/QuotaDeck/trigger.txt` |
 
-`config.json` currently has one key:
+`config.json` carries `debugSnapshots` plus the state engine's settings (defaults shown):
 
 ```json
 {
-  "debugSnapshots": false
+  "debugSnapshots": false,
+  "showRemaining": true,
+  "watchLimit": 0.5,
+  "criticalLimit": 0.7,
+  "providers": {},
+  "order": []
 }
 ```
+
+- `showRemaining` flips every face between what is left (the default) and what was used. Bands are
+  always judged by the *used* fraction, whichever end the figures show.
+- `watchLimit` / `criticalLimit` are the band boundaries. They are clamped on load: the watch limit
+  stays below the critical limit, and the pair inside 0.01–1.0.
+- `providers` is per-reader enablement and schedule, keyed by reader id: `enabled`,
+  `busyIntervalSeconds`, `idleIntervalSeconds`, `staleAfterMinutes`. A provider missing from the file
+  gets the defaults (enabled, 30 s busy, 5 min idle, 15 min stale).
+- `order` is the face order (provider ids, first is leftmost). Stored ids no provider claims are
+  ignored, and providers the order has never seen are appended at the end.
 
 ## Dev harness
 
@@ -81,11 +98,26 @@ The on-device check needs a human with Logi Options+:
 2. **All actions > Quota Deck > Sample face**.
 3. Drag it onto any key.
 
-The teal "73%" face appears on that key. Pressing it plays the red panel pulse across all nine keys.
+The teal face appears on that key, showing what is left by default for the sample's 73%-used reading
+(`27%`, `wk 59%`, a 27% ring); with `"showRemaining": false` it shows the used figures (`73%`,
+`wk 41%`, 73%). Pressing it plays the red panel pulse across all nine keys.
+
+## Tests
+
+```bash
+dotnet test QuotaDeckPlugin/tests/QuotaDeck.Core.Tests.csproj
+```
 
 ## Layout
 
 ```
+core/                     the provider-agnostic state engine
+  Model/                  snapshots, statuses, bands, watchers, face figures
+  Readers/                reader contract, degradation, reader memory stores
+  Policy/                 backoff, refresh schedule, freshness
+  Text/                   percent and countdown copy
+  Settings/               settings, per-reader config, provider order
+tests/                    xunit suite for core/ (and the only project that runs without the SDK)
 src/
   QuotaDeckPlugin.cs        plugin entry point: 1 s ticker, dev harness
   QuotaDeckApplication.cs   required empty ClientApplication subclass (universal plugin host quirk)
