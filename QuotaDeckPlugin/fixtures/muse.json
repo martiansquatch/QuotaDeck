@@ -1,0 +1,8 @@
+{
+  "id": "muse",
+  "displayName": "Muse",
+  "fidelity": "official",
+  "status": { "kind": "needsAuth" },
+  "windows": [],
+  "headlineId": "session"
+}

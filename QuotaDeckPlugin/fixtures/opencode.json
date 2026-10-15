@@ -1,0 +1,13 @@
+{
+  "id": "opencode",
+  "displayName": "OpenCode",
+  "fidelity": "official",
+  "status": { "kind": "ok" },
+  "windows": [
+    { "id": "rolling", "label": "5-hour limit", "usedFraction": 0.55, "resetsAt": "2027-03-13T20:00:00+00:00", "durationSeconds": 18000 },
+    { "id": "weekly", "label": "Weekly limit", "usedFraction": 0.30, "resetsAt": "2027-03-16T00:00:00+00:00" },
+    { "id": "monthly", "label": "Monthly limit", "usedFraction": 0.12, "resetsAt": "2027-04-01T00:00:00+00:00" }
+  ],
+  "headlineId": "rolling",
+  "weeklyId": "weekly"
+}
