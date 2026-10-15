@@ -126,7 +126,7 @@ namespace Loupedeck.QuotaDeckPlugin
                 _overlay = scene.Overlay(t);
                 _frame = frame;
                 _frameNo++;
-                SaveDebugFrame(frame, _frameNo);
+                SaveDebugFrame(frame, _overlay, _frameNo);
                 RefreshAll();
             }
             catch (Exception ex)
@@ -195,9 +195,14 @@ namespace Loupedeck.QuotaDeckPlugin
 
         // ---- debug: dump frames as PNG so a scene can be checked without the device ----
 
-        private static void SaveDebugFrame(BitmapImage? frame, Int32 no)
+        /// <summary>
+        /// Writes panel_NN.png (what the nine keys show together) and panelview_NN.png (the same with the
+        /// bezels blacked out, i.e. as seen on the device). Scenes that draw a shared frame are dumped as
+        /// is; scenes that only tint (the pulse) are composed from the keys' own faces plus the overlay.
+        /// </summary>
+        private static void SaveDebugFrame(BitmapImage? frame, BitmapColor overlay, Int32 no)
         {
-            if (frame == null || !DeckConfig.Current.DebugSnapshots)
+            if (!DeckConfig.Current.DebugSnapshots)
             {
                 return;
             }
@@ -205,24 +210,58 @@ namespace Loupedeck.QuotaDeckPlugin
             {
                 var dir = DeckConfig.SnapshotDirectory;
                 Directory.CreateDirectory(dir);
-                frame.SaveToFile(Path.Combine(dir, $"panel_{no:00}.png"));
 
-                // "as seen on the device": the frame with the bezels blacked out
-                using var b = new BitmapBuilder(Width, Height);
-                b.Clear(BitmapColor.Black);
-                b.DrawImage(frame, 0, 0, BitmapRotation.None);
+                BitmapImage? composed = frame;
+                BitmapImage? owned = null;
+                if (composed == null)
+                {
+                    using var b = new BitmapBuilder(Width, Height);
+                    b.Clear(FaceRenderer.Background);
+                    QuotaKey[] all;
+                    lock (QuotaKey.All)
+                    {
+                        all = QuotaKey.All.ToArray();
+                    }
+                    foreach (var key in all)
+                    {
+                        var cell = Layout.CellOf(key);
+                        if (cell < 0)
+                        {
+                            continue;
+                        }
+                        using var face = key.RenderFace(PluginImageSize.Width116);
+                        b.DrawImage(face, CellX(cell) + (TileSize - face.Width) / 2, CellY(cell) + (TileSize - face.Height) / 2, BitmapRotation.None);
+                    }
+                    owned = b.ToImage();
+                    composed = owned;
+                }
+
+                using var view = new BitmapBuilder(Width, Height);
+                view.Clear(BitmapColor.Black);
+                view.DrawImage(composed, 0, 0, BitmapRotation.None);
+                if (overlay.A > 0)
+                {
+                    view.FillRectangle(0, 0, Width, Height, overlay); // so the dump matches what the keys show
+                }
+
+                using var panel = view.ToImage();
+                panel.SaveToFile(Path.Combine(dir, $"panel_{no:00}.png"));
+
+                // "as seen on the device": the panel with the bezels blacked out
                 var black = BitmapColor.Black;
-                b.FillRectangle(0, 0, Width, OriginY, black);
-                b.FillRectangle(0, OriginY + 2 * Pitch + TileSize, Width, Height, black);
-                b.FillRectangle(0, 0, OriginX, Height, black);
-                b.FillRectangle(OriginX + 2 * Pitch + TileSize, 0, Width, Height, black);
+                view.FillRectangle(0, 0, Width, OriginY, black);
+                view.FillRectangle(0, OriginY + 2 * Pitch + TileSize, Width, Height, black);
+                view.FillRectangle(0, 0, OriginX, Height, black);
+                view.FillRectangle(OriginX + 2 * Pitch + TileSize, 0, Width, Height, black);
                 for (var i = 0; i < 2; i++)
                 {
-                    b.FillRectangle(OriginX + TileSize + i * Pitch, 0, Pitch - TileSize, Height, black);
-                    b.FillRectangle(0, OriginY + TileSize + i * Pitch, Width, Pitch - TileSize, black);
+                    view.FillRectangle(OriginX + TileSize + i * Pitch, 0, Pitch - TileSize, Height, black);
+                    view.FillRectangle(0, OriginY + TileSize + i * Pitch, Width, Pitch - TileSize, black);
                 }
-                using var view = b.ToImage();
-                view.SaveToFile(Path.Combine(dir, $"panelview_{no:00}.png"));
+                using var bezelView = view.ToImage();
+                bezelView.SaveToFile(Path.Combine(dir, $"panelview_{no:00}.png"));
+
+                owned?.Dispose();
             }
             catch
             {

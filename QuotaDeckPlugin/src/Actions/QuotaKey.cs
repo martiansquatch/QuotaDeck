@@ -88,6 +88,9 @@ namespace Loupedeck.QuotaDeckPlugin
             image?.Dispose();
         }
 
+        /// <summary>Render the bare face (no scene, no snapshot side effect); used by the panel debug dump.</summary>
+        internal BitmapImage RenderFace(PluginImageSize size) => FaceRenderer.Draw(size, this.BuildFace());
+
         /// <summary>Run the key's action from the dev harness; the press debounce does not apply.</summary>
         internal void ExecuteForDebug(String? actionParameter) => this.Execute(actionParameter!);
     }
