@@ -201,6 +201,17 @@ public sealed class ClaudeReader : UsageReaderBase
 
     public override string DisplayName => this._profile.DisplayName;
 
+    /// <summary>
+    /// The hold-off covers the endpoint step alone.
+    ///
+    /// Codenotch checks <c>retryNoEarlierThan</c> inside <c>fetchFromKeychain</c>
+    /// (<c>ClaudeOAuthProvider.swift:303-309</c>), *after* the Desktop cache and the CLI have had
+    /// their chance: the deadline is the endpoint's, and a 429 on it is no reason to darken a ring a
+    /// cheaper local source can still fill. See <see cref="ReadSnapshotAsync"/> for how the reader
+    /// applies it.
+    /// </summary>
+    protected override HoldOffScope HoldOffScope => HoldOffScope.ReaderManaged;
+
     /// <summary>The profile this reader draws, exposed so the module can name it in a log line.</summary>
     public ClaudeProfile Profile => this._profile;
 
@@ -294,6 +305,22 @@ public sealed class ClaudeReader : UsageReaderBase
 
         try
         {
+            // The hold-off covers the endpoint step alone, and it is checked here — after the cache
+            // and the CLI, exactly where Codenotch checks `retryNoEarlierThan`
+            // (ClaudeOAuthProvider.swift:303-309). Nothing is marked: this read never asks the
+            // endpoint, so the base reads the throw as the replay it is — no ladder rung, no
+            // deadline write — and degrades it to Stale with the reading's own date. The existing
+            // catch below can still answer with a reading that was only skipped for being asked for
+            // too fresh, which is Codenotch's own fallback.
+            if (this.IsHeldOff(now) && this.LoadHoldOffUntil() is { } deadline)
+            {
+                throw new ReaderException(ReaderError.RateLimited(deadline - now));
+            }
+
+            // About to ask the endpoint, so the base may judge the outcome as the endpoint's own: a
+            // 429 takes its rung and rewrites the deadline, a success clears both.
+            this.MarkRateLimitedSourceConsulted();
+
             return await this.FetchFromEndpointAsync(endpointAllowance, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception) when (desktop is { } reading
