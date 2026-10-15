@@ -21,10 +21,22 @@ using Microsoft.Data.Sqlite;
 /// tried after <c>mode=ro</c> has failed, which is exactly when there is no write-ahead log left to
 /// miss and ignoring it costs nothing.</description></item>
 /// </list>
-/// On SQLite 3.22+ a <c>mode=ro</c> open no longer fails when the <c>-shm</c> is merely *absent* —
-/// it rebuilds a wal-index in heap memory — so the fallback carries the case where the sidecar
-/// exists but cannot be read or the database refuses a read-only open for another reason (permissions,
-/// an interrupted writer), rather than the merely-quiet case.
+/// On SQLite 3.22+ a <c>mode=ro</c> open no longer fails when the <c>-shm</c> sidecar is merely
+/// *absent* — it rebuilds a wal-index in heap memory instead — but a sidecar or log that exists and
+/// cannot be read still fails, as does any other refusal of a read-only open. The fallback carries
+/// those cases, not the quiet one.
+///
+/// Failure timing is why <see cref="Open"/> probes before handing a connection out: on this SQLite a
+/// read-only WAL open can return success and only report SQLITE_CANTOPEN on the first *statement*.
+/// The Swift helper checks the open result alone, which serves an unusable handle to its caller and
+/// lets the empty row set below turn it into a silent zero.
+///
+/// <c>Pooling=False</c> is deliberate: Microsoft.Data.Sqlite pools connections by default, so a
+/// disposed connection would keep its native handle (and its shared-memory mapping) alive in this
+/// process. These reads are minutes apart, and a borrow that truly ends is this helper's contract —
+/// the Swift version closes, and so does this one. <c>Mode=ReadOnly</c> alongside the URI's
+/// <c>mode=ro</c> states the same thing twice for the two parsers involved: SQLite's URI handling
+/// and Microsoft.Data.Sqlite's connection-string handling.
 ///
 /// The native SQLite library ships under <c>runtimes/&lt;rid&gt;/native/</c> in the NuGet layout;
 /// in a host whose probing layout misses it, <see cref="Open"/> throws <see cref="DllNotFoundException"/>
@@ -51,16 +63,27 @@ public static class SqliteReadOnly
 
         foreach (var query in new[] { "mode=ro", "immutable=1" })
         {
+            SqliteConnection? connection = null;
             try
             {
-                var connection = new SqliteConnection($"Data Source=file:{path}?{query};Mode=ReadOnly");
+                connection = new SqliteConnection($"Data Source=file:{path}?{query};Mode=ReadOnly;Pooling=False");
                 connection.Open();
+
+                // A read-only WAL open can succeed and only fail on the *first statement* — the open
+                // call does not touch the write-ahead log, the query does, and SQLITE_CANTOPEN comes
+                // out of step(), not open_v2(). Probing here is what makes "mode=ro first, immutable
+                // second" true: a form that cannot serve rows is rejected before it is handed out.
+                using var probe = connection.CreateCommand();
+                probe.CommandText = "SELECT count(*) FROM sqlite_master";
+                probe.ExecuteScalar();
+
                 return connection;
             }
             catch (SqliteException)
             {
                 // This form is not available for this file; the next one may be. Neither failure is
                 // an error by itself — the caller gets null when both are gone.
+                connection?.Dispose();
             }
         }
 
