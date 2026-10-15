@@ -88,9 +88,13 @@ public class UsageResetWatcherTests
         Assert.Equal(date2, this._events[0].ResetsAt);
     }
 
+    /// <summary>The clock pins the Swift fixture (<c>Tests/UsageResetWatcherTests.swift</c>, whose
+    /// setUp leaves the clock at 1000): the deadline is still ahead, so a one-second drift is the
+    /// same window, and the previous deadline has not elapsed for the rule to unlock.</summary>
     [Fact]
     public void DoesNotAlertWhenAFutureResetTimestampDriftsLater()
     {
+        this._clock = DateTimeOffset.FromUnixTimeSeconds(1_000);
         var firstDeadline = DateTimeOffset.FromUnixTimeSeconds(2_000);
         var shiftedDeadline = DateTimeOffset.FromUnixTimeSeconds(2_001);
 
@@ -100,9 +104,12 @@ public class UsageResetWatcherTests
         Assert.Empty(this._events);
     }
 
+    /// <summary>Same pinned clock: before a known deadline a lower reading is a correction or
+    /// fluctuation, not a reset, however large the drop.</summary>
     [Fact]
     public void DoesNotAlertForALargeDropBeforeAKnownResetDeadline()
     {
+        this._clock = DateTimeOffset.FromUnixTimeSeconds(1_000);
         var deadline = DateTimeOffset.FromUnixTimeSeconds(2_000);
 
         this._watcher.Observe(Snapshot("codex", "Codex", 0.51, resetsAt: deadline));
