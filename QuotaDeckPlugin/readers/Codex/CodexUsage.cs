@@ -24,7 +24,8 @@ public static class CodexUsage
 {
     private static readonly string[] Iso8601Formats =
     [
-        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFFFK",
+        // Seven F's is .NET's own tick precision; the endpoint's stamps use three.
+        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK",
         "yyyy-MM-dd'T'HH:mm:ssK",
     ];
 
