@@ -14,10 +14,17 @@ using QuotaDeck.Core.Settings;
 /// <c>status(for:)</c>, <c>placeholder(_:)</c>, the <c>generations</c>/<c>acceptsResult</c>
 /// bookkeeping and <c>publish</c>'s <c>blockingSpentWeek()</c> — plus the per-provider rate-limit
 /// handling of <c>Sources/Providers/ClaudeOAuthProvider.swift</c> (<c>fetchFromKeychain(reusableFor:)</c>,
-/// lines 303-353: the hold-off check, <c>consecutiveRateLimits</c>, <c>backoff(forAttempt:retryAfter:)</c>
-/// and the back-off save, with <c>endpointFetch</c>'s coalescing of concurrent calls) and the refresh
-/// deadline (lines 204-223 of the store). Codenotch keeps the last good readings and the deadline in
-/// the store and the rate-limit counter in the provider; the split is invisible from outside.
+/// lines 303-353: the hold-off check, <c>consecutiveRateLimits</c>,
+/// <c>backoff(forAttempt:retryAfter:)</c> and the back-off save, with <c>endpointFetch</c>'s
+/// coalescing of concurrent calls) and the refresh deadline (lines 204-223 of the store).
+/// Codenotch keeps the last good readings and the deadline in the store and the rate-limit counter
+/// in the provider; the split is invisible from outside.
+///
+/// One coalescing difference is deliberate. Swift joins every overlap and supersedes only through
+/// <c>cancelRefresh</c>; QuotaDeck has no cancellation entry point, so an explicit
+/// <see cref="Freshness.FromSource"/> look supersedes a scheduled <see cref="Freshness.Standard"/>
+/// read instead of riding it — a look must not be made to wait out a slow schedule — while every
+/// other overlap joins whatever is in flight. See <see cref="FetchAsync"/>.
 ///
 /// Telling apart the cases that reach the same status is the whole job: a 429 and an expired token
 /// both age the reading, a refusal keeps it, a sign-out clears it, and a cancellation records
@@ -33,19 +40,22 @@ public abstract class UsageReaderBase : IUsageReader
     private readonly object _fetchGate = new();
 
     /// <summary>
-    /// The read cycle a concurrent call may join. A completed cycle is never joined again, so the
-    /// next caller starts a fresh read rather than being handed a stale answer.
+    /// The read cycle a concurrent call may join, with the freshness it was started under. A
+    /// completed cycle is never joined again, so the next caller starts a fresh read rather than
+    /// being handed a stale answer.
     /// </summary>
-    private Task<ProviderSnapshot>? _inFlight;
+    private (Task<ProviderSnapshot> Task, Freshness Freshness)? _inFlight;
 
     private int _generation;
     private int _consecutiveRateLimits;
 
     /// <summary>
     /// What the last published result said. A cancellation repeats this instead of inventing a
-    /// failure for it; see <see cref="Cancelled"/>.
+    /// failure for it; see <see cref="Cancelled"/>. The initial value is Swift's placeholder
+    /// default, <c>.stale(since: .distantPast)</c>: a cancellation before any fetch has a truthful
+    /// "nothing has been read" status rather than a false Ok.
     /// </summary>
-    private volatile ProviderStatus _lastStatus = ProviderStatus.Ok;
+    private volatile ProviderStatus _lastStatus = ProviderStatus.Stale(DateTimeOffset.MinValue);
 
     protected UsageReaderBase(
         ReaderConfig config,
@@ -115,19 +125,25 @@ public abstract class UsageReaderBase : IUsageReader
             Task<ProviderSnapshot> cycle;
             lock (this._fetchGate)
             {
-                if (freshness != Freshness.FromSource && this._inFlight is { IsCompleted: false } inFlight)
+                // Swift joins every overlap; the one deliberate difference here is that a FromSource
+                // look does not ride a scheduled Standard read — it asks for a request of its own
+                // and supersedes it, because there is no cancelRefresh here to reach for and a look
+                // must not be made to wait out a slow schedule. Everything else joins: a Live or
+                // FromSource read in flight is shared by whoever arrives.
+                if (this._inFlight is { } inFlight
+                    && !inFlight.Task.IsCompleted
+                    && !(inFlight.Freshness == Freshness.Standard && freshness == Freshness.FromSource))
                 {
-                    // A concurrent scheduled fetch joins the read already running: one request, the
-                    // same answer for both callers (ClaudeOAuthProvider.endpointFetch).
-                    cycle = inFlight;
+                    cycle = inFlight.Task;
                 }
                 else
                 {
-                    // FromSource never joins: it is what "refresh now" and a click ask for, a
-                    // request spent deliberately, and its newer generation supersedes the
-                    // scheduled read instead of riding it.
-                    cycle = this.RunReadCycle(freshness, cancellationToken, now);
-                    this._inFlight = cycle;
+                    // The generation moves under the gate, and Success re-checks it under the same
+                    // gate before saving, so two cycles finishing together cannot overwrite the
+                    // newer reading with the older one.
+                    var generation = ++this._generation;
+                    cycle = this.RunReadCycle(generation, freshness, cancellationToken);
+                    this._inFlight = (cycle, freshness);
                 }
             }
 
@@ -154,12 +170,10 @@ public abstract class UsageReaderBase : IUsageReader
     protected abstract Task<ProviderSnapshot> ReadAsync(Freshness freshness, CancellationToken cancellationToken);
 
     private async Task<ProviderSnapshot> RunReadCycle(
+        int generation,
         Freshness freshness,
-        CancellationToken cancellationToken,
-        DateTimeOffset startedAt)
+        CancellationToken cancellationToken)
     {
-        var generation = Interlocked.Increment(ref this._generation);
-
         Task<ProviderSnapshot> read;
         try
         {
@@ -167,26 +181,28 @@ public abstract class UsageReaderBase : IUsageReader
         }
         catch (Exception exception)
         {
+            var caughtAt = this._time.GetUtcNow();
             return cancellationToken.IsCancellationRequested
-                ? this.Cancelled(this._time.GetUtcNow())
-                : this.Failed(exception, startedAt);
+                ? this.Cancelled(caughtAt)
+                : this.Failed(exception, caughtAt);
         }
 
         var deadline = Task.Delay(this.FetchDeadline, this._time, cancellationToken);
         var winner = await Task.WhenAny(read, deadline).ConfigureAwait(false);
         if (winner != read)
         {
+            var caughtAt = this._time.GetUtcNow();
             if (cancellationToken.IsCancellationRequested)
             {
                 // Cancelled, not late: nothing is recorded, and no late-remembering is attached
                 // to a read nobody is waiting for any more.
-                return this.Cancelled(this._time.GetUtcNow());
+                return this.Cancelled(caughtAt);
             }
 
             // The abandoned read reports nowhere, but its answer may still be the freshest one
             // this reader has if nothing newer has started.
             _ = this.RememberLate(read, generation);
-            return this.OnFailure(ReaderError.TimedOut, startedAt);
+            return this.OnFailure(ReaderError.TimedOut, caughtAt);
         }
 
         try
@@ -201,19 +217,35 @@ public abstract class UsageReaderBase : IUsageReader
 
             return this.Success(fresh, generation, this._time.GetUtcNow());
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The read honoured the caller's token: a cancellation, not a failure, and not
+            // published as one.
+            return this.Cancelled(this._time.GetUtcNow());
+        }
         catch (OperationCanceledException)
         {
-            // The read honoured the token: a cancellation, not a failure, and not published as one.
-            return this.Cancelled(this._time.GetUtcNow());
+            // HttpClient reports its own timeout as TaskCanceledException while the caller's token
+            // is untouched. That is a hung endpoint, not a cancellation: it reads as no response
+            // and is recorded like any other failure — Swift maps the URLSession timeout the same
+            // way. The guard above is what keeps this case out of the cancellation path.
+            return this.OnFailure(ReaderError.TimedOut, this._time.GetUtcNow());
         }
         catch (Exception exception)
         {
+            var caughtAt = this._time.GetUtcNow();
             return cancellationToken.IsCancellationRequested
-                ? this.Cancelled(this._time.GetUtcNow())
-                : this.Failed(exception, startedAt);
+                ? this.Cancelled(caughtAt)
+                : this.Failed(exception, caughtAt);
         }
     }
 
+    /// <summary>
+    /// Publishes a fresh reading, or hands back the current one when a newer generation has taken
+    /// over. The generation check and the store write share the fetch gate with the generation
+    /// increment, so two cycles finishing together cannot both pass the check and let the older
+    /// save land after the newer one.
+    /// </summary>
     private ProviderSnapshot Success(ProviderSnapshot fresh, int generation, DateTimeOffset returnedAt)
     {
         // The spent-week block is applied at publication, like the store's `blockingSpentWeek()`: a
@@ -221,20 +253,23 @@ public abstract class UsageReaderBase : IUsageReader
         // says. The blocked shape is what is remembered, so a later failure re-shows it as it was.
         var published = (fresh with { FetchedAt = returnedAt }).BlockingSpentWeek();
 
-        if (Volatile.Read(ref this._generation) != generation)
+        lock (this._fetchGate)
         {
-            // A newer generation has started — and possibly completed — in the meantime. Its
-            // reading is the current one; handing this one to the caller would be returning a
-            // number the reader itself has already replaced.
-            return this._store.Load(this.Id)?.Snapshot
-                ?? this.Degraded(this._lastStatus, returnedAt);
-        }
+            if (this._generation != generation)
+            {
+                // A newer generation has started — and possibly completed — in the meantime. Its
+                // reading is the current one; handing this one to the caller would be returning a
+                // number the reader itself has already replaced.
+                return this._store.Load(this.Id)?.Snapshot
+                    ?? this.Degraded(this._lastStatus, returnedAt);
+            }
 
-        Interlocked.Exchange(ref this._consecutiveRateLimits, 0);
-        this._store.SaveBackoffUntil(this.Id, null);
-        this._store.Save(this.Id, new ReaderMemory(published, returnedAt));
-        this._lastStatus = published.Status;
-        return published;
+            Interlocked.Exchange(ref this._consecutiveRateLimits, 0);
+            this._store.SaveBackoffUntil(this.Id, null);
+            this._store.Save(this.Id, new ReaderMemory(published, returnedAt));
+            this._lastStatus = published.Status;
+            return published;
+        }
     }
 
     private async Task RememberLate(Task<ProviderSnapshot> read, int generation)
@@ -242,11 +277,10 @@ public abstract class UsageReaderBase : IUsageReader
         try
         {
             var fresh = await read.ConfigureAwait(false);
-            if (Volatile.Read(ref this._generation) == generation)
-            {
-                // Stamped when it actually returned, like any other success.
-                this.Success(fresh, generation, this._time.GetUtcNow());
-            }
+
+            // Stamped when it actually returned, like any other success. Success itself decides
+            // whether this generation is still the current one.
+            this.Success(fresh, generation, this._time.GetUtcNow());
         }
         catch
         {

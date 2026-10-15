@@ -12,16 +12,22 @@ using System.Globalization;
 ///
 /// The server's own hint is honoured only as a *floor-raiser*: it answers <c>Retry-After: 0</c>, and
 /// obeying that literally means retrying immediately, which is what keeps you rate limited. So the
-/// wait starts at a minute and doubles for each 429 in a row, and <see cref="Compute"/> never lowers
-/// a hint that is handed to it. <see cref="RetryAfter"/> caps the header itself at the same
-/// fifteen-minute ceiling — a deliberate hardening over Swift's pass-through, so a broken or hostile
-/// header cannot turn into an unbounded hold-off.
+/// wait starts at a minute and doubles for each 429 in a row; only that schedule is capped, never
+/// the server's hint, which <see cref="Compute"/> takes at face value. <see cref="RetryAfter"/>
+/// refuses hints that are not finite and applies a 24-hour sanity bound, which exists solely so no
+/// header can overflow a TimeSpan.
 /// </summary>
 public static class Backoff
 {
     public const double FloorSeconds = 60;
 
     public const double CeilingSeconds = 15 * 60;
+
+    /// <summary>
+    /// A sanity bound, not a schedule: no real hint is a day out, and the numbers a hostile header
+    /// parses to ("1e300") do not fit a TimeSpan. The server's hint is otherwise left alone.
+    /// </summary>
+    public const double MaxHintSeconds = 24 * 60 * 60;
 
     /// <summary>
     /// A deadline that expires a moment after a poll would still wait out the next poll, silently
@@ -58,10 +64,11 @@ public static class Backoff
 
     /// <summary>
     /// <c>Retry-After</c> is either a number of seconds or an HTTP date (RFC 1123). Nil when the
-    /// header is missing, does not parse, or is not finite; a past date never yields a negative
-    /// delay, and a finite hint is capped at <see cref="CeilingSeconds"/> so no header can hold a
-    /// reader off longer than the schedule's own ceiling. That cap is a deliberate departure from
-    /// Swift's <c>retryAfter(from:)</c>, which passes any number straight through.
+    /// header is missing, does not parse, or is not finite — "Infinity" and "NaN" parse into
+    /// doubles and then explode inside TimeSpan.FromSeconds. A finite hint is honoured whatever its
+    /// size, in line with Codenotch ("only our schedule is capped, never the server's hint"); the
+    /// 24-hour <see cref="MaxHintSeconds"/> bound exists only so a "1e300" or a far-future date
+    /// cannot overflow the TimeSpan.
     /// </summary>
     public static TimeSpan? RetryAfter(string? header, DateTimeOffset now)
     {
@@ -73,11 +80,8 @@ public static class Backoff
         var trimmed = header.Trim();
         if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
         {
-            // "Infinity" and "NaN" parse happily into doubles and then explode inside
-            // TimeSpan.FromSeconds; a non-finite hint is not a hint. A finite giant ("1e300")
-            // is clamped before the TimeSpan is built, which would otherwise overflow.
             return double.IsFinite(seconds)
-                ? TimeSpan.FromSeconds(Math.Clamp(seconds, 0, CeilingSeconds))
+                ? TimeSpan.FromSeconds(Math.Clamp(seconds, 0, MaxHintSeconds))
                 : null;
         }
 
@@ -88,7 +92,7 @@ public static class Backoff
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
                 out var date))
         {
-            return TimeSpan.FromSeconds(Math.Clamp((date - now).TotalSeconds, 0, CeilingSeconds));
+            return TimeSpan.FromSeconds(Math.Clamp((date - now).TotalSeconds, 0, MaxHintSeconds));
         }
 
         return null;

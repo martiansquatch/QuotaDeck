@@ -219,8 +219,52 @@ public class UsageReaderBaseTests
         var snapshot = await reader.FetchAsync(Freshness.Standard, cancellation.Token);
 
         Assert.Equal(0, reader.Calls);
-        Assert.NotEqual(ProviderStatusKind.Error, snapshot.Status.Kind);
         Assert.Null(this._store.Load("test"));
+
+        // Swift's placeholder default: nothing has ever been read, so the face says so rather than
+        // claiming Ok.
+        Assert.Equal(ProviderStatus.Stale(DateTimeOffset.MinValue), snapshot.Status);
+    }
+
+    /// <summary>HttpClient reports its own timeout as a TaskCanceledException with the caller's
+    /// token untouched. That is a hung endpoint, not a cancellation: it must read as no response
+    /// and be recorded like any other failure.</summary>
+    [Fact]
+    public async Task AnHttpClientTimeoutIsNotACancellation()
+    {
+        var reader = this.Reader();
+        reader.OnRead = (_, _) => Task.FromException<ProviderSnapshot>(
+            new TaskCanceledException("The request timed out."));
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(ProviderStatus.Error("no response"), snapshot.Status);
+
+        // Recorded, not swallowed: the next caller to walk away repeats the failure's status
+        // rather than a fresh-looking placeholder.
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var cancelled = await reader.FetchAsync(Freshness.Standard, cancellation.Token);
+        Assert.Equal(ProviderStatus.Error("no response"), cancelled.Status);
+    }
+
+    /// <summary>The hold-off and the failure's timestamp come from the moment the failure happened,
+    /// like Swift's Date() in the catch — not from when the request started.</summary>
+    [Fact]
+    public async Task FailureTimesAreTakenWhenTheFailureHappens()
+    {
+        var reader = this.Reader();
+        reader.OnRead = async (_, _) =>
+        {
+            await Task.Yield();
+            this._clock.Now = this._clock.Now.AddSeconds(50);
+            throw new ReaderException(ReaderError.RateLimited());
+        };
+
+        await reader.FetchAsync(Freshness.Standard);
+
+        // Start + 50 s (when the 429 arrived) + the first rung of the ladder.
+        Assert.Equal(TestData.Now.AddSeconds(110), this._store.LoadBackoffUntil("test"));
     }
 
     /// <summary>An older read must not hand its result to a caller once a newer one has replaced it:
@@ -247,6 +291,31 @@ public class UsageReaderBaseTests
 
         Assert.Equal(0.60, outdated.UsedFraction!.Value, 10);
         Assert.Equal(0.60, this._store.Load("test")!.Snapshot.UsedFraction!.Value, 10);
+    }
+
+    /// <summary>The generation check and the store write are one critical section, so a cycle that
+    /// finishes second cannot overwrite the newer reading it was superseded by.</summary>
+    [Fact]
+    public async Task ANearSimultaneousOlderCycleDoesNotOverwriteTheNewerReading()
+    {
+        var reader = this.Reader();
+        var slowRead = new TaskCompletionSource<ProviderSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        reader.OnRead = (freshness, _) => freshness == Freshness.FromSource
+            ? Task.FromResult(TestData.SessionAndWeekly(0.60, 0.30))
+            : slowRead.Task;
+
+        var olderFetch = reader.FetchAsync(Freshness.Standard);
+
+        // The newer cycle completes and publishes while the older read is still out.
+        await reader.FetchAsync(Freshness.FromSource);
+        Assert.Equal(0.60, this._store.Load("test")!.Snapshot.UsedFraction!.Value, 10);
+
+        // The older read lands last. The store still holds the newer reading, and so its caller.
+        slowRead.SetResult(TestData.SessionAndWeekly(0.40, 0.20));
+        var older = await olderFetch;
+
+        Assert.Equal(0.60, this._store.Load("test")!.Snapshot.UsedFraction!.Value, 10);
+        Assert.Equal(0.60, older.UsedFraction!.Value, 10);
     }
 
     /// <summary>Concurrent scheduled fetches are one request: the second joins the read in flight
@@ -292,6 +361,55 @@ public class UsageReaderBaseTests
 
         Assert.Equal(1, reader.Calls);
         Assert.Equal(TestData.Now.AddSeconds(60), this._store.LoadBackoffUntil("test"));
+    }
+
+    /// <summary>The join rule at its edges: a Live or FromSource read in flight is shared by
+    /// whoever arrives, and only a look supersedes a scheduled read (pinned by
+    /// <see cref="AnOutdatedReadingIsNotReturnedToItsCaller"/>).</summary>
+    [Fact]
+    public async Task OnlyALookSupersedesAScheduledRead()
+    {
+        // A Live read in flight is shared with a scheduled caller.
+        var liveFirst = this.Reader();
+        var liveFirstRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        liveFirst.OnRead = async (_, _) =>
+        {
+            await liveFirstRelease.Task;
+            return TestData.SessionAndWeekly(0.42, 0.11);
+        };
+        var a = liveFirst.FetchAsync(Freshness.Live);
+        var b = liveFirst.FetchAsync(Freshness.Standard);
+        liveFirstRelease.SetResult();
+        await Task.WhenAll(a, b);
+        Assert.Equal(1, liveFirst.Calls);
+
+        // A scheduled read in flight is shared with a Live caller.
+        var scheduledFirst = this.Reader();
+        var scheduledFirstRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scheduledFirst.OnRead = async (_, _) =>
+        {
+            await scheduledFirstRelease.Task;
+            return TestData.SessionAndWeekly(0.42, 0.11);
+        };
+        var c = scheduledFirst.FetchAsync(Freshness.Standard);
+        var d = scheduledFirst.FetchAsync(Freshness.Live);
+        scheduledFirstRelease.SetResult();
+        await Task.WhenAll(c, d);
+        Assert.Equal(1, scheduledFirst.Calls);
+
+        // Two looks share one request too.
+        var looks = this.Reader();
+        var looksRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        looks.OnRead = async (_, _) =>
+        {
+            await looksRelease.Task;
+            return TestData.SessionAndWeekly(0.42, 0.11);
+        };
+        var e = looks.FetchAsync(Freshness.FromSource);
+        var f = looks.FetchAsync(Freshness.FromSource);
+        looksRelease.SetResult();
+        await Task.WhenAll(e, f);
+        Assert.Equal(1, looks.Calls);
     }
 
     /// <summary>The stamp is when the read came back, not when it was asked for.</summary>
