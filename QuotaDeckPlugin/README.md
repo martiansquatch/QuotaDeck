@@ -106,18 +106,22 @@ The teal face appears on that key, showing what is left by default for the sampl
 
 ```bash
 dotnet test QuotaDeckPlugin/tests/QuotaDeck.Core.Tests.csproj
+dotnet test QuotaDeckPlugin/tests-readers/QuotaDeck.Readers.Tests.csproj
 ```
 
 ## Layout
 
 ```
 core/                     the provider-agnostic state engine
+  Faces/                  FaceModel and FaceComposer (snapshot + settings → face)
   Model/                  snapshots, statuses, bands, watchers, face figures
-  Readers/                reader contract, degradation, reader memory stores
-  Policy/                 backoff, refresh schedule, freshness
+  Readers/                reader contract, degradation, reader memory stores, provider modules
+  Policy/                 backoff, refresh schedule, refresh coordinator, freshness
   Text/                   percent and countdown copy
   Settings/               settings, per-reader config, provider order
+readers/                  provider reader implementations (one folder per provider) + Shared/
 tests/                    xunit suite for core/ (and the only project that runs without the SDK)
+tests-readers/            xunit suite for readers/, with scripted HTTP/process/clock fakes
 src/
   QuotaDeckPlugin.cs        plugin entry point: 1 s ticker, dev harness
   QuotaDeckApplication.cs   required empty ClientApplication subclass (universal plugin host quirk)

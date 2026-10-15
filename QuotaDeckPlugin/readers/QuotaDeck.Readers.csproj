@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    QuotaDeck reader implementations.
+
+    One assembly for every provider reader, so Phase 3-8 PRs only add files here (and never touch
+    this project file): the store/SQLite (Codex, Cursor, Antigravity), zstd (Claude transcripts)
+    and HTTP pieces are declared up front, even before the readers that need them exist.
+
+    The service interfaces live in QuotaDeck.Core.Readers.Services; this project carries the real
+    implementations under Shared/, and the provider folders hold one reader each.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>QuotaDeck.Readers</RootNamespace>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\core\QuotaDeck.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tests for the provider readers in QuotaDeck.Readers.
+
+    Every test that touches time or a process passes a fake; nothing here reads the wall clock or
+    starts a real executable. The fakes under Support/ mirror Codenotch's URLProtocol and process
+    stubs so reader tests can be written with the same shapes.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\readers\QuotaDeck.Readers.csproj" />
+    <ProjectReference Include="..\core\QuotaDeck.Core.csproj" />
+  </ItemGroup>
+
+</Project>
