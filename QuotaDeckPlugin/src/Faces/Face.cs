@@ -26,6 +26,12 @@ namespace Loupedeck.QuotaDeckPlugin
         /// <summary>Bottom label, e.g. the provider name.</summary>
         public String? Label { get; init; }
 
+        /// <summary>
+        /// A tint filled over the whole face after drawing, or null. Used to dim a stale or refused
+        /// reading without changing any of its texts.
+        /// </summary>
+        public BitmapColor? Overlay { get; init; }
+
         /// <summary>Brighter hairline and a border while the key is "doing something" (live faces, later phases).</summary>
         public Boolean Active { get; init; }
     }

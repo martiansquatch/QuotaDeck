@@ -8,8 +8,10 @@ namespace Loupedeck.QuotaDeckPlugin
     /// <summary>
     /// QuotaDeck - AI-provider quota faces for the Logitech MX Creative Keypad (Logi Actions SDK).
     ///
-    /// Phase 1: the "hello deck" gate. The plugin owns the shared 1 s ticker that live faces will subscribe to
-    /// and, when <c>debugSnapshots</c> is enabled, the trigger.txt dev harness (see the project README).
+    /// The plugin owns the shared 1 s ticker and the reader host: the host fetches provider readings
+    /// on the state engine's schedule, the seven provider keys draw them, and watcher events turn
+    /// into notifications and the panel pulse. When <c>debugSnapshots</c> is enabled, the trigger.txt
+    /// dev harness is also available (see the project README).
     /// </summary>
     public class QuotaDeckPlugin : Plugin
     {
@@ -19,6 +21,9 @@ namespace Loupedeck.QuotaDeckPlugin
 
         /// <summary>The single live plugin instance (actions walk up to it for the ticker and the snapshot folder).</summary>
         public static QuotaDeckPlugin? Instance { get; private set; }
+
+        /// <summary>The reader host, alive from Load to Unload.</summary>
+        public ReaderHost? Host { get; private set; }
 
         /// <summary>Raised once per second from a background thread. Handlers must be cheap.</summary>
         public event Action<Int32>? Tick;
@@ -39,6 +44,9 @@ namespace Loupedeck.QuotaDeckPlugin
             DeckConfig.Load();
             PluginLog.Info($"QuotaDeck starting. dataDir={DeckConfig.DataDirectory} debugSnapshots={DeckConfig.Current.DebugSnapshots}");
 
+            this.Host = new ReaderHost(this);
+            this.Host.Start();
+
             this._ticker = new Timer(_ => this.OnTick(), null, 1000, 1000);
 
             if (DeckConfig.Current.DebugSnapshots)
@@ -53,6 +61,8 @@ namespace Loupedeck.QuotaDeckPlugin
 
         public override void Unload()
         {
+            this.Host?.Dispose();
+            this.Host = null;
             Panel.Stop(refresh: false);
             this._ticker?.Dispose();
             this._ticker = null;
@@ -153,6 +163,20 @@ namespace Loupedeck.QuotaDeckPlugin
                 if (text.Equals("pulse", StringComparison.OrdinalIgnoreCase))
                 {
                     Panel.Play(new PulseScene(FaceRenderer.Alert));
+                    return;
+                }
+
+                // "fetch" refetches every reader from source; "fetch <providerId>" just one. Both
+                // respect nothing but the readers that exist — a debug command, not the schedule.
+                if (text.Equals("fetch", StringComparison.OrdinalIgnoreCase))
+                {
+                    this.Host?.FetchNow(null);
+                    return;
+                }
+
+                if (text.StartsWith("fetch ", StringComparison.OrdinalIgnoreCase))
+                {
+                    this.Host?.FetchNow(text[6..].Trim());
                     return;
                 }
 
