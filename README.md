@@ -17,6 +17,12 @@ Providers: Claude, Codex, OpenCode Go, Antigravity, Cursor, Muse, Devin.
 
 Status: early development. macOS first; Windows later.
 
+## Development
+
+The plugin lives in [`QuotaDeckPlugin/`](QuotaDeckPlugin/README.md). That README covers the build,
+where the link/log/config/snapshots live on macOS, the `trigger.txt` dev harness, and how to put the
+sample face on a keypad key through Logi Options+.
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

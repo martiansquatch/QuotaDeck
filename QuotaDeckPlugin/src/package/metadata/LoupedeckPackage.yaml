@@ -1,0 +1,61 @@
+# ==================================================================================================
+# GENERAL SETTINGS
+# ==================================================================================================
+
+# Package type. Must be plugin4 for plugins.
+type: plugin4
+
+# Name that identifies the plugin. Must not end in "Plugin".
+name: QuotaDeck
+
+# Plugin name that is shown to the user.
+displayName: Quota Deck
+
+# Short description of the plugin.
+description: AI-provider quota faces for the Logitech MX Creative Keypad. Each of the nine LCD keys shows one provider's usage ring; a full-panel pulse when a tracked limit is hit.
+
+# Name of the plugin library file.
+pluginFileName: QuotaDeckPlugin.dll
+
+# Plugin version.
+version: 0.1.0
+
+# Author of the plugin.
+author: QuotaDeck contributors
+
+# Copyright information.
+copyright: Copyright (c) 2026 QuotaDeck contributors
+
+# ==================================================================================================
+# PLUGIN PROPERTIES
+# ==================================================================================================
+
+# Location of plugin files on macOS (relative to the plugin base directory).
+pluginFolderMac: bin
+
+# Location of plugin files on Windows is not set yet: macOS is the first target.
+
+# List of devices the plugin is optimized for.
+supportedDevices:
+    # LoupedeckCtFamily covers the Loupedeck CT, Live and Live S, Razer Stream Controller,
+    # Razer Stream Controller X and the Logitech MX Creative Keypad.
+    - LoupedeckCtFamily
+
+# Minimum Loupedeck version supported by the plugin.
+minimumLoupedeckVersion: 6.0
+
+# ==================================================================================================
+# MARKETPLACE SETTINGS
+# ==================================================================================================
+
+# Name of the license that the plugin is licensed under.
+license: MIT
+
+# URL of the plugin license.
+licenseUrl: https://opensource.org/licenses/MIT
+
+# URL of the plugin homepage.
+homePageUrl: https://github.com/martiansquatch/QuotaDeck
+
+# URL of the support page where users can report bugs.
+supportPageUrl: https://github.com/martiansquatch/QuotaDeck/issues
