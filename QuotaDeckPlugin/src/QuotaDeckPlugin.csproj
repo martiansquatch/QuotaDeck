@@ -38,6 +38,10 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\core\QuotaDeck.Core.csproj" />
+  </ItemGroup>
+
   <Target Name="CopyPackage" AfterTargets="PostBuildEvent">
     <Message Text="Copying package files to $(OutputPath)..\" Importance="High" />
     <ItemGroup>
