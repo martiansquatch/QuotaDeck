@@ -147,13 +147,15 @@ public class ClaudeTokenRefresherTests
 
     // MARK: - Through the reader
 
-    /// <summary>The reader consults the gate at the top of every fetch, which is its only timer.</summary>
+    /// <summary>
+    /// The reader consults the gate after every fetch — its only timer — and the renewal runs on its
+    /// own task once the reading is built.
+    /// </summary>
     [Fact]
     public async Task TheReaderRenewsATokenThatIsAboutToExpire()
     {
         var rig = new ClaudeRig();
         var item = rig.AddCredential(expiresAt: rig.Clock.Now.AddMinutes(1));
-        rig.Http.Respond(System.Net.HttpStatusCode.OK, """{"limits":[{"kind":"session","percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}""");
         rig.Http.Respond(System.Net.HttpStatusCode.OK, """{"limits":[{"kind":"session","percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}""");
         rig.Http.Respond(System.Net.HttpStatusCode.OK, """{"limits":[{"kind":"session","percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}""");
 
@@ -176,11 +178,9 @@ public class ClaudeTokenRefresherTests
             options.LiveMinEndpointInterval = TimeSpan.Zero;
         });
 
-        // Nothing is known about the expiry yet, so the first tick cannot launch anything.
+        // The first fetch learns the expiry, and its finally then hands the gate its turn.
         _ = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
-        Assert.Empty(process.Requests);
-
-        _ = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
+        Assert.True(await process.WaitForRequestsAsync(1), "the renewal never launched");
 
         var request = Assert.Single(process.Requests);
         Assert.Equal("/opt/homebrew/bin/claude", request.FileName);
@@ -189,9 +189,19 @@ public class ClaudeTokenRefresherTests
         Assert.Equal(rig.DataDirectory + "/usage-scratch", request.Environment!["PWD"]);
         Assert.Equal(TimeSpan.FromSeconds(30), request.Timeout);
 
-        // The renewal was judged by the expiry moving, so the rotated token is the one on the wire.
+        // The renewal was judged by the expiry moving, so the rotated token is the one on the wire —
+        // and the 8-hour expiry means nothing to renew on the next tick. The process request is
+        // recorded before the item is rewritten, so this waits for the renewal's own re-read rather
+        // than for the launch.
+        for (var attempt = 0; attempt < 200 && rig.Keychain.ReadCount < 2; attempt++)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(2, rig.Keychain.ReadCount);
         _ = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
         Assert.Equal("Bearer renewed", rig.Http.Requests[^1].Headers.GetValues("Authorization").Single());
+        Assert.Single(process.Requests);
     }
 
     /// <summary>A renewal whose expiry did not move is not retried on the next tick.</summary>
@@ -211,9 +221,67 @@ public class ClaudeTokenRefresherTests
         });
 
         _ = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
+        Assert.True(await process.WaitForRequestsAsync(1), "the renewal never launched");
         _ = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
         _ = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
 
+        // The same expiry value is never attempted twice, so the later ticks add nothing.
+        Assert.False(await process.WaitForRequestsAsync(2, TimeSpan.FromMilliseconds(500)));
         Assert.Single(process.Requests);
+    }
+
+    /// <summary>
+    /// A renewal can take its whole process timeout (30 s), and a fetch's deadline is 60: consulting
+    /// the gate before the reading would let a slow `claude` start decide whether a reading arrives.
+    /// The renewal runs on its own task, after the snapshot is built.
+    /// </summary>
+    [Fact]
+    public async Task ASlowRenewalDoesNotDelayTheFetch()
+    {
+        var rig = new ClaudeRig();
+        rig.AddCredential(expiresAt: rig.Clock.Now.AddMinutes(1));
+        rig.Http.Respond(System.Net.HttpStatusCode.OK, """{"limits":[{"kind":"session","percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}""");
+        rig.Http.Respond(System.Net.HttpStatusCode.OK, """{"limits":[{"kind":"session","percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}""");
+
+        using var started = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var process = new ScriptedProcessRunner
+        {
+            OnRun = _ =>
+            {
+                started.Set();
+                release.Wait(TimeSpan.FromSeconds(30));
+                return new ProcessResult { ExitCode = 1, StandardOutput = string.Empty };
+            },
+        };
+
+        var reader = rig.Reader(options =>
+        {
+            options.Context = options.Context! with { Process = process };
+            options.RefreshCliFactory = () => "/opt/homebrew/bin/claude";
+            options.MinEndpointInterval = TimeSpan.Zero;
+            options.LiveMinEndpointInterval = TimeSpan.Zero;
+        });
+
+        try
+        {
+            // The first fetch learns the expiry and then — after its reading is built — hands the
+            // gate its turn.
+            var first = await reader.FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource);
+            Assert.Equal(QuotaDeck.Core.Model.ProviderStatusKind.Ok, first.Status.Kind);
+
+            // The renewal is under way and blocked inside its process...
+            Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the renewal never started");
+
+            // ...and the next fetch still comes back promptly, because the renewal is not on its path.
+            var second = await reader
+                .FetchAsync(QuotaDeck.Core.Policy.Freshness.FromSource)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(QuotaDeck.Core.Model.ProviderStatusKind.Ok, second.Status.Kind);
+        }
+        finally
+        {
+            release.Set();
+        }
     }
 }

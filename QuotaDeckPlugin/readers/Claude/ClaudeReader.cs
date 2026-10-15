@@ -135,11 +135,20 @@ public sealed class ClaudeReader : UsageReaderBase
 
     private (ProviderSnapshot Snapshot, DateTimeOffset At, string Token)? _lastEndpoint;
 
-    /// <summary>The held token, so the keychain is read once per token rather than once per minute.</summary>
+    /// <summary>
+    /// The held token, so the keychain is read once per token rather than once per minute.
+    /// </summary>
     private ClaudeCredentials? _credentials;
 
-    /// <summary>Read-only bookkeeping for the token refresher, costing no extra keychain traffic.</summary>
-    private DateTimeOffset? _tokenExpiry;
+    /// <summary>
+    /// When the token runs out, as of the last keychain read — expired or not.
+    ///
+    /// Read-only bookkeeping for the token refresher, which has to know how long is left *before*
+    /// deciding to do anything, and kept here because this is already the one place that reads the
+    /// item. Held as ticks so the background renewal reads one atomic value rather than a nullable
+    /// struct that a fetch may be writing at the same moment; -1 is "nothing read yet".
+    /// </summary>
+    private long _tokenExpiryTicks = -1;
 
     public ClaudeReader(ReaderContext context)
         : this(new ClaudeReaderOptions { Context = context })
@@ -181,7 +190,7 @@ public sealed class ClaudeReader : UsageReaderBase
         var refreshCli = new Lazy<string?>(options.RefreshCliFactory
             ?? (() => ClaudeStandaloneCli.Locate(this._home, this._fileSystem)));
         this._refresher = new ClaudeTokenRefresher(
-            expiry: () => this._tokenExpiry,
+            expiry: () => this.TokenExpiry,
             reload: this.ReloadTokenExpiryAsync,
             cli: () => refreshCli.Value,
             process: options.Context.Process,
@@ -223,15 +232,27 @@ public sealed class ClaudeReader : UsageReaderBase
 
     protected override async Task<ProviderSnapshot> ReadAsync(Freshness freshness, CancellationToken cancellationToken)
     {
+        try
+        {
+            return await this.ReadSnapshotAsync(freshness, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // After the reading, never before it. The renewal can take up to the process timeout
+            // (30 s) and this fetch's own deadline is 60, so consulting the gate first — which is
+            // where Codenotch's independent one-minute timer puts it — would let a slow `claude`
+            // start decide whether a reading arrives at all.
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                this.ConsiderTokenRenewal(this._time.GetUtcNow());
+            }
+        }
+    }
+
+    private async Task<ProviderSnapshot> ReadSnapshotAsync(Freshness freshness, CancellationToken cancellationToken)
+    {
         var now = this._time.GetUtcNow();
         var (desktopAllowance, cliAllowance, endpointAllowance) = this.Allowances(freshness);
-
-        // Codenotch drives the token refresher from a one-minute timer of its own; the plugin's tick
-        // is the only timer this reader has, so the tick is when the gate is consulted.
-        if (this._profile.Slug is null)
-        {
-            await this._refresher.ConsiderRenewingAsync(now, cancellationToken).ConfigureAwait(false);
-        }
 
         // Ahead of both the CLI and the token: this is the cheapest source and the only one that can
         // never interrupt anyone.
@@ -288,6 +309,50 @@ public sealed class ClaudeReader : UsageReaderBase
             return this.Snapshot(reading.Windows, this._profile.OrganizationPlan());
         }
     }
+
+    /// <summary>
+    /// Asks the token refresher whether this is the moment, on its own task.
+    ///
+    /// Fire-and-forget on purpose: awaiting the renewal — before or after the reading — would let a
+    /// slow `claude` start spend the fetch's deadline. The gate is what makes calling it on every
+    /// tick safe: nothing to do unless the expiry is within four minutes, one attempt per expiry
+    /// value ever, a ten-minute cooldown, and the refresher's own guard against overlap. It also
+    /// only ever runs for the default profile, whose token is the one Claude Code renews.
+    /// </summary>
+    private void ConsiderTokenRenewal(DateTimeOffset now)
+    {
+        if (this._profile.Slug is not null)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await this._refresher.ConsiderRenewingAsync(now, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A renewal never fails a fetch and never surfaces as an unobserved task exception:
+                // the next tick simply consults the same gate again.
+            }
+        });
+    }
+
+    /// <summary>What the refresher reads: the expiry from the last keychain read, or nil.</summary>
+    private DateTimeOffset? TokenExpiry
+    {
+        get
+        {
+            var ticks = Interlocked.Read(ref this._tokenExpiryTicks);
+            return ticks < 0 ? null : DateTimeOffset.FromUnixTimeMilliseconds(ticks);
+        }
+    }
+
+    /// <summary>One atomic store, because the renewal reads this from its own thread.</summary>
+    private void SetTokenExpiry(DateTimeOffset expiry) =>
+        Interlocked.Exchange(ref this._tokenExpiryTicks, expiry.ToUnixTimeMilliseconds());
 
     /// <summary>The CLI, resolved once — the answer only changes when someone installs or removes Claude Code.</summary>
     private IClaudeUsageCli? Cli()
@@ -434,8 +499,12 @@ public sealed class ClaudeReader : UsageReaderBase
 
         try
         {
-            var snapshot = await this.EndpointFetchAsync(true, cancellationToken).ConfigureAwait(false);
-            this._lastEndpoint = (snapshot, this._time.GetUtcNow(), token);
+            var (snapshot, usedToken) = await this.EndpointFetchAsync(true, cancellationToken).ConfigureAwait(false);
+
+            // The token that *answered*, not the one this method started with: a 401 re-reads the
+            // item and may come back with a rotated token, and recording the old one would make the
+            // next tick inside the floor spend a request to learn nothing.
+            this._lastEndpoint = (snapshot, this._time.GetUtcNow(), usedToken);
             return snapshot;
         }
         catch (ReaderException exception)
@@ -450,7 +519,9 @@ public sealed class ClaudeReader : UsageReaderBase
         }
     }
 
-    private async Task<ProviderSnapshot> EndpointFetchAsync(bool retryingOnUnauthorized, CancellationToken cancellationToken)
+    private async Task<(ProviderSnapshot Snapshot, string Token)> EndpointFetchAsync(
+        bool retryingOnUnauthorized,
+        CancellationToken cancellationToken)
     {
         var token = await this.CurrentTokenAsync(cancellationToken).ConfigureAwait(false);
 
@@ -471,6 +542,7 @@ public sealed class ClaudeReader : UsageReaderBase
             this._credentials = null;
             if (retryingOnUnauthorized)
             {
+                // The retry's own token is the one that answered.
                 return await this.EndpointFetchAsync(false, cancellationToken).ConfigureAwait(false);
             }
 
@@ -519,7 +591,7 @@ public sealed class ClaudeReader : UsageReaderBase
                 + "Some Enterprise and team plans don't report them."));
         }
 
-        return this.Snapshot(windows, this._credentials?.SubscriptionType);
+        return (this.Snapshot(windows, this._credentials?.SubscriptionType), token);
     }
 
     /// <summary>
@@ -540,7 +612,7 @@ public sealed class ClaudeReader : UsageReaderBase
         }
 
         var fresh = await this._claudeKeychain.LoadAsync(cancellationToken).ConfigureAwait(false);
-        this._tokenExpiry = fresh.ExpiresAt;
+        this.SetTokenExpiry(fresh.ExpiresAt);
         if (fresh.IsExpired(now))
         {
             throw new ReaderException(ReaderError.CredentialExpired);
@@ -558,7 +630,7 @@ public sealed class ClaudeReader : UsageReaderBase
         try
         {
             var fresh = await this._claudeKeychain.LoadAsync(cancellationToken).ConfigureAwait(false);
-            this._tokenExpiry = fresh.ExpiresAt;
+            this.SetTokenExpiry(fresh.ExpiresAt);
             return fresh.ExpiresAt;
         }
         catch (ReaderException)

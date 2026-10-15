@@ -137,6 +137,40 @@ public class ClaudeReaderEndpointTests
         Assert.Equal(2, rig.Keychain.ReadCount);
     }
 
+    /// <summary>
+    /// The reading is recorded against the token that *answered*. A 401 re-reads the item and may
+    /// come back with a rotated token; recording the one the fetch started with would make the next
+    /// tick inside the floor spend a request to rediscover that it already has the answer.
+    /// </summary>
+    [Fact]
+    public async Task A401RetryRecordsTheTokenThatAnswered()
+    {
+        var rig = new ClaudeRig();
+        var item = rig.AddCredential(accessToken: "old-token");
+        var transport = new RawTransport(
+            new HttpResponseMessage(HttpStatusCode.Unauthorized),
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(UsagePayload) });
+
+        // The token rotates under the 401, which is what a 401 means here.
+        transport.OnRequest = _ =>
+        {
+            item.Modified = rig.Clock.Now.AddMinutes(1);
+            item.Data = FakeKeychain.Credential("rotated", rig.Clock.Now.AddHours(8));
+        };
+
+        var reader = rig.Reader(options => options.Http = transport);
+
+        var first = await reader.FetchAsync(Freshness.Standard);
+        Assert.Equal(ProviderStatus.Ok, first.Status);
+        Assert.Equal(2, transport.Requests.Count);
+
+        // Inside the endpoint's floor the held reading answers, so no third request is spent.
+        var second = await reader.FetchAsync(Freshness.Standard);
+
+        Assert.Equal(2, transport.Requests.Count);
+        Assert.Equal(0.42, second.UsedFraction!.Value, 4);
+    }
+
     /// <summary>A keychain failure must not stop the next tick from reading again.</summary>
     [Fact]
     public async Task AKeychainFailureDoesNotStopTheNextTickFromReading()

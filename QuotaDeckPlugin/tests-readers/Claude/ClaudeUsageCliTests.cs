@@ -8,8 +8,9 @@ using QuotaDeck.Readers.Claude;
 /// every token rotation and a grant against the old one stops working about an hour later. These pin
 /// what its output means, where the binary is found, and where it is run.
 ///
-/// Ported from Codenotch <c>Tests/ClaudeUsageCLITests.swift</c>, with the fixture's `Asia/Jakarta`
-/// swapped for `Europe/Berlin` and the tool-naming prose line dropped.
+/// Ported from Codenotch <c>Tests/ClaudeUsageCLITests.swift</c>, with the fixture's original time
+/// zone swapped for <c>Europe/Berlin</c> (and the expected UTC instants recomputed) and the
+/// tool-naming prose line dropped.
 /// </summary>
 public class ClaudeUsageCliTests
 {
@@ -171,6 +172,42 @@ public class ClaudeUsageCliTests
 
         // Midnight in Berlin is 22:00 UTC the day before.
         Assert.Equal(Utc("2026-09-07T22:00:00Z"), reset);
+    }
+
+    /// <summary>
+    /// Feb 29 exists only in a leap year. The year candidates run over year−1/year/year+1, so two of
+    /// the three can be non-leap — and Swift's `calendar.date(from:)` answers nil for those rather
+    /// than throwing. A `new DateTime(...)` that threw would escape the parse and, through the
+    /// provider's catch-all, cost the whole CLI reading.
+    /// </summary>
+    [Fact]
+    public void ALeapDayResetResolvesInALeapYear()
+    {
+        // Read in 2028 itself: 2027's candidate does not exist, 2028's does.
+        Assert.Equal(
+            Utc("2028-02-29T04:59:00Z"),
+            ClaudeUsageCli.ResetDate("Feb 29 at 5:59am (Europe/Berlin)", Utc("2028-02-28T12:00:00Z")));
+
+        // Read the year before: both earlier candidates are impossible and the leap year wins.
+        Assert.Equal(
+            Utc("2028-02-29T04:59:00Z"),
+            ClaudeUsageCli.ResetDate("Feb 29 at 5:59am (Europe/Berlin)", Utc("2027-03-01T00:00:00Z")));
+    }
+
+    /// <summary>The whole line survives: the percentage that parsed is kept and the reset is there.</summary>
+    [Fact]
+    public void AWeeklyWindowResettingOnALeapDayKeepsItsReading()
+    {
+        const string Text = """
+        Current session: 10% used · resets Feb 28 at 5:59am (Europe/Berlin)
+        Current week (all models): 4% used · resets Feb 29 at 5:59am (Europe/Berlin)
+        """;
+
+        var windows = ClaudeUsageCli.Parse(Text, Utc("2028-02-28T12:00:00Z"));
+
+        Assert.Equal(["session", "weekly_all"], windows.Select(window => window.Id));
+        Assert.Equal(0.04, windows[1].UsedFraction!.Value, 4);
+        Assert.Equal(Utc("2028-02-29T04:59:00Z"), windows[1].ResetsAt);
     }
 
     /// <summary>`America/...` carries an "am" of its own, so the zone comes off before the am/pm fix.</summary>

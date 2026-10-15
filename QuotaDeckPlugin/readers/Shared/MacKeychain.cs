@@ -168,7 +168,7 @@ public sealed class MacKeychain : IKeychain
         query.Add(Native.MatchLimit, Native.MatchLimitAll);
 
         var status = Native.SecItemCopyMatching(query.Build(), out var result);
-        if (status != KeychainStatus.Success)
+        if (status != KeychainStatus.Success || result == IntPtr.Zero)
         {
             return [];
         }
@@ -197,7 +197,11 @@ public sealed class MacKeychain : IKeychain
         // refusal is a status, never a dialogue nobody is there to answer.
         lock (InteractionGate)
         {
-            Native.SecKeychainGetUserInteractionAllowed(out var wasAllowed);
+            // Pre-set, as Codenotch does (`var wasAllowed: DarwinBoolean = true`): a failed query must
+            // never leave the restored value at whatever the call left behind, or interaction could
+            // stay off for the whole process.
+            byte wasAllowed = 1;
+            Native.SecKeychainGetUserInteractionAllowed(out wasAllowed);
             Native.SecKeychainSetUserInteractionAllowed(0);
             try
             {
@@ -286,6 +290,18 @@ public sealed class MacKeychain : IKeychain
         public static readonly IntPtr BooleanTrue = Constant("kCFBooleanTrue");
 
         /// <summary>
+        /// The framework's own key and value callbacks for a dictionary of CF types.
+        ///
+        /// `dlsym` answers with the *address* of the exported callback struct, which is exactly what
+        /// `CFDictionaryCreate` wants — so these are handed over as they are and never dereferenced.
+        /// With the type callbacks in place the dictionary retains what it is given, which is why the
+        /// query releases both its own objects and the dictionary.
+        /// </summary>
+        public static readonly IntPtr KeyCallbacks = Callbacks("kCFTypeDictionaryKeyCallBacks");
+
+        public static readonly IntPtr ValueCallbacks = Callbacks("kCFTypeDictionaryValueCallBacks");
+
+        /// <summary>
         /// A CFDictionary built for one call. Values are the framework's own constants or objects
         /// created here; the created ones are released with the dictionary.
         /// </summary>
@@ -333,8 +349,8 @@ public sealed class MacKeychain : IKeychain
             {
                 if (this.Dictionary == IntPtr.Zero && this._pairs.Count > 0)
                 {
-                    // A dictionary whose callbacks are null: every value is either a framework
-                    // constant or an object created here, so no retain/release callback is wanted.
+                    // The framework's own type callbacks: the dictionary then retains its keys and
+                    // values, the same dictionary Codenotch builds.
                     var keys = new IntPtr[this._pairs.Count];
                     var values = new IntPtr[this._pairs.Count];
                     for (var index = 0; index < this._pairs.Count; index++)
@@ -344,7 +360,7 @@ public sealed class MacKeychain : IKeychain
                     }
 
                     this.Dictionary = CFDictionaryCreate(
-                        IntPtr.Zero, keys, values, this._pairs.Count, IntPtr.Zero, IntPtr.Zero);
+                        IntPtr.Zero, keys, values, this._pairs.Count, KeyCallbacks, ValueCallbacks);
                 }
 
                 return this.Dictionary;
@@ -495,6 +511,16 @@ public sealed class MacKeychain : IKeychain
             return symbol == IntPtr.Zero ? IntPtr.Zero : Marshal.ReadIntPtr(symbol);
         }
 
+        /// <summary>
+        /// The address of an exported struct — not the pointer it holds. CoreFoundation defines the
+        /// type callbacks, so it is asked first.
+        /// </summary>
+        private static IntPtr Callbacks(string name)
+        {
+            var symbol = DlSym(CoreFoundationHandle, name);
+            return symbol == IntPtr.Zero ? DlSym(SecurityHandle, name) : symbol;
+        }
+
         [DllImport(LibSystem, EntryPoint = "dlopen", CharSet = CharSet.Ansi)]
         private static extern IntPtr DlOpen(string path, int mode);
 
@@ -518,7 +544,12 @@ public sealed class MacKeychain : IKeychain
         [DllImport(CoreFoundation)]
         private static extern nint CFStringGetMaximumSizeForEncoding(nint length, uint encoding);
 
+        /// <summary>
+        /// CFString's `Boolean` return is one byte in C. Without the U1 marshalling, .NET reads a
+        /// four-byte BOOL and the upper register bytes can flip a true into a false.
+        /// </summary>
         [DllImport(CoreFoundation)]
+        [return: MarshalAs(UnmanagedType.U1)]
         private static extern bool CFStringGetCString(IntPtr theString, IntPtr buffer, nint bufferSize, uint encoding);
 
         [DllImport(CoreFoundation)]

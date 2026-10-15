@@ -201,6 +201,12 @@ public sealed class ClaudeUsageCli : IClaudeUsageCli
     /// <summary>The two spellings a reset time arrives in.</summary>
     private static readonly string[] ResetFormats = ["MMM d 'at' h:mmtt", "MMM d 'at' htt"];
 
+    /// <summary>
+    /// The year the reset line's month and day are read under. It is a leap year, and it is thrown
+    /// away immediately: the real year is chosen from the candidates around `now`.
+    /// </summary>
+    private const string ParseAnchor = "2000 ";
+
     /// <summary>The named tier <c>/usage</c> prints above the windows, copied as printed.</summary>
     public static string? Plan(string text)
     {
@@ -323,11 +329,22 @@ public sealed class ClaudeUsageCli : IClaudeUsageCli
         // Two spellings, because the minutes are dropped when they are zero: `Sep 7 at 2:59pm`, but
         // `Sep 7 at 3pm` on the hour. A single `h:mm` pattern reads the first and rejects the second,
         // which is a window that loses its reset time for one hour in sixty.
+        //
+        // The line carries no year, and .NET would fill the missing component from the *current*
+        // date — which makes the parse itself depend on the wall clock: "Feb 29" does not parse at
+        // all in a non-leap year, before the candidate loop below can choose a leap one. The year is
+        // decided after this parse, so a fixed leap-year anchor reads the components the line does
+        // carry, and `DaysInMonth` decides which years they fit.
         DateTime parsed = default;
         var ok = false;
         foreach (var format in ResetFormats)
         {
-            if (DateTime.TryParseExact(stamp, format, CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+            if (DateTime.TryParseExact(
+                    ParseAnchor + stamp,
+                    "yyyy " + format,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out parsed))
             {
                 ok = true;
                 break;
@@ -343,6 +360,15 @@ public sealed class ClaudeUsageCli : IClaudeUsageCli
         DateTimeOffset? nearest = null;
         foreach (var year in (int[])[thisYear - 1, thisYear, thisYear + 1])
         {
+            // Feb 29 exists only in a leap year, and Swift's `calendar.date(from:)` answers nil for a
+            // candidate that does not — it never throws. `new DateTime(...)` does, and an exception
+            // here would escape the parse and cost the whole CLI reading, so the impossible
+            // candidates are skipped the way the calendar skips them.
+            if (parsed.Day > DateTime.DaysInMonth(year, parsed.Month))
+            {
+                continue;
+            }
+
             var local = new DateTime(year, parsed.Month, parsed.Day, parsed.Hour, parsed.Minute, 0, DateTimeKind.Unspecified);
             var candidate = new DateTimeOffset(local, zone.GetUtcOffset(local));
             if (nearest is null || Math.Abs((candidate - now).Ticks) < Math.Abs((nearest.Value - now).Ticks))
