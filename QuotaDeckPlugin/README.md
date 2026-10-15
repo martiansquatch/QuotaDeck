@@ -34,6 +34,14 @@ The build does three extra things after compiling:
    single line `<repo>/QuotaDeckPlugin/bin/Debug`;
 3. asks the running Logi Plugin Service to reload QuotaDeck (`open loupedeck:plugin/QuotaDeck/reload`).
 
+A fourth post-build copy flattens native libraries next to the managed ones. NuGet lays SQLite's
+`libe_sqlite3.dylib` (and any future native dependency) out under `runtimes/<rid>/native/`, but a
+host that loads the plugin DLLs from `bin/Debug/bin/` does not probe that tree for `DllImport`
+libraries — a plain .NET host there fails with `DllNotFoundException: e_sqlite3`, and the Logi
+Plugin Service's own probing is unverified. Every native library for the current platform
+(`osx-arm64` then `osx-x64`, arm64 winning when a file name exists in both; `win-x64` on Windows)
+is copied flat next to `QuotaDeckPlugin.dll`; the `runtimes/` tree is left in place.
+
 If the service does not pick the plugin up, restart it and wait ~6 s:
 
 ```bash
