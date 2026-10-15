@@ -59,6 +59,19 @@ public static class Backoff
         return TimeSpan.FromSeconds(Math.Max(FloorSeconds, hint));
     }
 
+    /// <summary>
+    /// <c>min(900, max(60 * 2^min(attempt, 4), retryAfter ?? 0))</c> seconds — the ladder with the
+    /// whole wait, the server's hint included, inside the cap. That is OpenCode
+    /// (<c>OpenCodeProvider.swift:206-211</c>); <see cref="Compute"/> only caps the doubling and
+    /// honours a larger hint in full.
+    /// </summary>
+    public static TimeSpan LadderCapped(int attempt, TimeSpan? retryAfter = null)
+    {
+        var doubled = Math.Min(CeilingSeconds, FloorSeconds * Math.Pow(2, Math.Min(Math.Max(attempt, 0), 4)));
+        var hint = retryAfter?.TotalSeconds ?? 0;
+        return TimeSpan.FromSeconds(Math.Min(CeilingSeconds, Math.Max(doubled, hint)));
+    }
+
     /// <summary>True while the deadline is still far enough away to be worth respecting.</summary>
     public static bool ShouldHoldOff(
         DateTimeOffset? until,

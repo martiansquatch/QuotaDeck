@@ -116,7 +116,8 @@ public sealed class CodexReader : UsageReaderBase
         // Unused resets are a separate endpoint from the extra Spark / code-review windows. Start
         // that fetch before parsing extras so a slow or empty extras payload cannot skip the
         // credits row (CodexLocalProvider.swift:74-77).
-        var resetCredits = this.FetchResetCreditsAsync(credential, cancellationToken);
+        using var resetCreditsCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var resetCredits = this.FetchResetCreditsAsync(credential, resetCreditsCancellation.Token);
         try
         {
             var windows = CodexUsage.Windows(body, now, this.ShowExtraLimits);
@@ -140,12 +141,38 @@ public sealed class CodexReader : UsageReaderBase
                 AccountLabel = account?.Label,
             };
         }
+        catch
+        {
+            // The usage body has already decided the reading — nothing metered, an unreadable
+            // payload. Nobody is waiting for the credits detail, and a slow endpoint must not hold
+            // that status back until its own 15 s timeout.
+            resetCreditsCancellation.Cancel();
+            throw;
+        }
         finally
         {
-            // Awaited even when the usage parse throws — nothing metered, an unreadable body — so
-            // the concurrent fetch is never left unobserved. Its value is dropped: core's
-            // ProviderSnapshot has no reset-credits field yet. See the PR for the gap.
+            // Still awaited, so the fetch is never left unobserved; a cancelled detail fetch owes
+            // this cycle nothing. Its value is dropped: core's ProviderSnapshot has no
+            // reset-credits field yet. See the PR for the gap.
+            await ObserveResetCredits(resetCredits).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the detail fetch without letting its cancellation mask the reading's own outcome:
+    /// the token is cancelled on a usage-parse failure above, and the caller may have walked away.
+    /// Any other failure was already turned into nil inside
+    /// <see cref="FetchResetCreditsAsync"/>.
+    /// </summary>
+    private static async Task ObserveResetCredits(Task<CodexResetCredits?> resetCredits)
+    {
+        try
+        {
             _ = await resetCredits.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // See the summary: no value this cycle is owed.
         }
     }
 

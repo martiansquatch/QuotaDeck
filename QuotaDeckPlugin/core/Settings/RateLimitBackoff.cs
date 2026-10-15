@@ -8,8 +8,11 @@ namespace QuotaDeck.Core.Settings;
 /// <item><description>
 /// <see cref="Ladder"/> — the wait starts at a minute, doubles for each 429 in a row and stops at
 /// fifteen, with the server's own hint honoured only as a floor. That is Claude
-/// (<c>Sources/Providers/ClaudeOAuthProvider.swift</c>, <c>backoff(forAttempt:retryAfter:)</c>) and
-/// OpenCode (<c>OpenCodeProvider.swift:206-210</c>).
+/// (<c>Sources/Providers/ClaudeOAuthProvider.swift</c>, <c>backoff(forAttempt:retryAfter:)</c>).
+/// </description></item>
+/// <item><description>
+/// <see cref="LadderCapped"/> — the same ladder, but the whole wait including the server's hint is
+/// capped at fifteen minutes (<c>OpenCodeProvider.swift:206-211</c>).
 /// </description></item>
 /// <item><description>
 /// <see cref="Flat"/> — a flat <c>max(60 s, hint)</c> on every 429, no doubling. That is Codex
@@ -24,6 +27,9 @@ public enum RateLimitBackoff
 {
     /// <summary>60 s doubling to a 900 s cap, the server's hint as a floor. The default.</summary>
     Ladder,
+
+    /// <summary>The same ladder with the whole wait, hint included, capped at 900 s.</summary>
+    LadderCapped,
 
     /// <summary>A flat <c>max(60 s, hint)</c> on every 429.</summary>
     Flat,

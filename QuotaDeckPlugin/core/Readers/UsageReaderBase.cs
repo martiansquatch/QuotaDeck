@@ -14,7 +14,8 @@ using QuotaDeck.Core.Settings;
 /// <c>status(for:)</c>, <c>placeholder(_:)</c>, the <c>generations</c>/<c>acceptsResult</c>
 /// bookkeeping and <c>publish</c>'s <c>blockingSpentWeek()</c> — plus the per-provider rate-limit
 /// handling of <c>Sources/Providers/ClaudeOAuthProvider.swift</c> (<c>fetchFromKeychain(reusableFor:)</c>,
-/// lines 303-353: the hold-off check, <c>consecutiveRateLimits</c>,
+/// lines 303-353: the hold-off check — whole-read by default, or per-source for a
+/// <see cref="HoldOffScope.ReaderManaged"/> reader — <c>consecutiveRateLimits</c>,
 /// <c>backoff(forAttempt:retryAfter:)</c> and the back-off save, with <c>endpointFetch</c>'s
 /// coalescing of concurrent calls) and the refresh deadline (lines 204-223 of the store).
 /// Codenotch keeps the last good readings and the deadline in the store and the rate-limit counter
@@ -86,6 +87,27 @@ public abstract class UsageReaderBase : IUsageReader
     protected virtual RateLimitBackoff RateLimitBackoffStyle => this.Config.RateLimitBackoff;
 
     /// <summary>
+    /// Whether the persisted 429 hold-off suppresses this reader's whole read or only the steps the
+    /// reader applies it to; see <see cref="HoldOffScope"/>. Defaults to
+    /// <see cref="HoldOffScope.WholeRead"/>.
+    /// </summary>
+    protected virtual HoldOffScope HoldOffScope => HoldOffScope.WholeRead;
+
+    /// <summary>
+    /// When the stored 429 deadline expires, if one is recorded. For a
+    /// <see cref="HoldOffScope.ReaderManaged"/> reader to consult on the steps that are held off;
+    /// the base records and clears it either way.
+    /// </summary>
+    protected DateTimeOffset? HoldOffUntil => this._store.LoadBackoffUntil(this.Id);
+
+    /// <summary>
+    /// Whether the stored deadline is still in force at <paramref name="now"/>, with the usual
+    /// one-second slack.
+    /// </summary>
+    protected bool IsHeldOff(DateTimeOffset now) =>
+        this.HoldOffUntil is { } until && Backoff.ShouldHoldOff(until, now);
+
+    /// <summary>
     /// How long one fetch gets before this class stops waiting for it.
     ///
     /// Not a cancellation, and it cannot be one: at the bottom of a credential read there may be a
@@ -122,10 +144,13 @@ public abstract class UsageReaderBase : IUsageReader
 
             var now = this._time.GetUtcNow();
 
-            if (this._store.LoadBackoffUntil(this.Id) is { } until && Backoff.ShouldHoldOff(until, now))
+            if (this.HoldOffScope == HoldOffScope.WholeRead
+                && this._store.LoadBackoffUntil(this.Id) is { } until
+                && Backoff.ShouldHoldOff(until, now))
             {
                 // Asked to slow down and still slowing down: this is not a new 429, so the penalty is
-                // neither counted nor extended. It reads as staleness, like any other hold-off.
+                // neither counted nor extended. It reads as staleness, like any other hold-off. A
+                // ReaderManaged reader skips this check and applies the deadline itself, per source.
                 return this.Degraded(
                     Degradation.StatusFor(ReaderError.RateLimited(until - now), now), now);
             }
@@ -313,19 +338,27 @@ public abstract class UsageReaderBase : IUsageReader
             // The server's hint is honoured only as a floor-raiser: it answers `Retry-After: 0`, and
             // obeying that literally is what keeps you rate limited. Which wait follows the hint
             // depends on the provider's own counterpart: the ladder starts at a minute and doubles
-            // for each 429 in a row (Claude, OpenCode), while Codex, Devin and Muse wait a flat
-            // max(60, hint) every time. The deadline outlives the process either way. The count is
-            // raised atomically: two cycles (a scheduled read and a superseding look) may fail here
-            // at once, and each must take its own rung of the ladder.
-            var attempt = Interlocked.Increment(ref this._consecutiveRateLimits) - 1;
-            var wait = this.RateLimitBackoffStyle == RateLimitBackoff.Flat
-                ? Backoff.Flat(error.RetryAfter)
-                : Backoff.Compute(attempt, error.RetryAfter);
+            // for each 429 in a row, stopping at fifteen (Claude); OpenCode's ladder is the same but
+            // caps the whole wait, hint included; Codex, Devin and Muse wait a flat max(60, hint)
+            // every time. The deadline outlives the process either way. Only the climbing styles
+            // consume a rung — a flat wait must not leave the ladder higher for a later climb.
+            var wait = this.RateLimitBackoffStyle switch
+            {
+                RateLimitBackoff.Flat => Backoff.Flat(error.RetryAfter),
+                RateLimitBackoff.LadderCapped => Backoff.LadderCapped(this.NextLadderRung(), error.RetryAfter),
+                _ => Backoff.Compute(this.NextLadderRung(), error.RetryAfter),
+            };
             this._store.SaveBackoffUntil(this.Id, now + wait);
         }
 
         return this.Degraded(Degradation.StatusFor(error, now), now);
     }
+
+    /// <summary>
+    /// The rung this 429 takes, raised atomically: two cycles (a scheduled read and a superseding
+    /// look) may fail here at once, and each must take its own rung of the ladder.
+    /// </summary>
+    private int NextLadderRung() => Interlocked.Increment(ref this._consecutiveRateLimits) - 1;
 
     /// <summary>
     /// What a cancelled caller sees: what was last published, aged but never turned into a failure —

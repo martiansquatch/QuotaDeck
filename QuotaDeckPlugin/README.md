@@ -89,12 +89,22 @@ killall LogiPluginService
 The 429 wait follows the provider, and each choice ports its Swift counterpart: `"Ladder"` (the
 default) starts at 60 s, doubles for each 429 in a row and stops at 900 s with the server's
 `Retry-After` only ever raising the floor — Codenotch's Claude
-(`Sources/Providers/ClaudeOAuthProvider.swift`, `backoff(forAttempt:retryAfter:)`) and OpenCode
-(`OpenCodeProvider.swift:206-210`); `"Flat"` waits `max(60 s, hint)` on every 429 with no doubling —
-Codex (`CodexLocalProvider.swift:161-173`, pinned by its reader), Devin
-(`DevinLocalProvider.swift:64`) and Muse (`MuseLocalProvider.swift:96`). Cursor has no backoff logic
-of its own. Whichever the setting says, the deadline is persisted per reader, so a relaunch cannot
-walk back into the limit.
+(`Sources/Providers/ClaudeOAuthProvider.swift`, `backoff(forAttempt:retryAfter:)`); `"LadderCapped"`
+is the same ladder with the whole wait, hint included, inside the 900 s cap — Codenotch's OpenCode
+(`OpenCodeProvider.swift:206-211`, pinned by its reader in a follow-up); `"Flat"` waits
+`max(60 s, hint)` on every 429 with no doubling — Codex (`CodexLocalProvider.swift:161-173`, pinned
+by its reader), Devin (`DevinLocalProvider.swift:64`) and Muse (`MuseLocalProvider.swift:96`).
+Cursor has no backoff logic of its own. Whichever the setting says, the deadline is persisted per
+reader, so a relaunch cannot walk back into the limit, and a flat wait never spends the ladder's
+rungs.
+
+A persisted deadline suppresses the reader's whole fetch by default: no source is tried until it
+expires. A reader with several sources can take the `ReaderManaged` hold-off scope instead — the
+base skips its own check and still records and clears the deadline, while the reader consults
+`IsHeldOff(now)` on the steps that need it and lets its other sources answer. That is the shape of
+Codenotch's Claude provider, whose hold-off sits inside the keychain step
+(`Sources/Providers/ClaudeOAuthProvider.swift:303-309`) after the Desktop cache and CLI steps have
+had their chance; the Claude reader adopts it in a follow-up.
 
 ## Keys and the host
 

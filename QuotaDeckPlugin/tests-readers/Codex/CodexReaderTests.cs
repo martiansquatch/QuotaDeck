@@ -440,29 +440,47 @@ public class CodexReaderTests
     }
 
     /// <summary>
-    /// The concurrent reset-credits fetch is awaited even when the usage parse throws — here a body
-    /// with no windows — so it is never left unobserved.
+    /// A successful read still waits for the concurrent reset-credits fetch (CodexLocalProvider
+    /// awaits it while building the snapshot): the cycle cannot return while the detail is pending.
     /// </summary>
     [Fact]
-    public async Task TheResetCreditsFetchIsAwaitedEvenWhenTheUsageParseThrows()
+    public async Task TheResetCreditsFetchIsAwaitedBeforeASuccessfulReadingReturns()
     {
         using var home = new CodexTestHome();
         CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
 
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var transport = new GatedResetCreditsTransport(gate);
+        var transport = new GatedResetCreditsTransport(BothWindowsBody, gate);
         var reader = Reader(home.Root, transport, new InMemoryReaderStateStore(), new FakeClock(Now));
 
         var fetch = reader.FetchAsync(Freshness.Standard);
         await transport.CreditsReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // The usage body has already thrown nothingMetered; the cycle is still holding the credits
-        // fetch, so it cannot return before the gate opens.
         Assert.False(fetch.IsCompleted);
 
         gate.SetResult();
         var snapshot = await fetch;
+        Assert.Equal(ProviderStatusKind.Ok, snapshot.Status.Kind);
+    }
+
+    /// <summary>
+    /// A usage body that decides the reading (here: nothing metered) cancels the reset-credits
+    /// request rather than waiting out a slow endpoint to its own 15 s timeout.
+    /// </summary>
+    [Fact]
+    public async Task AUsageParseFailureCancelsTheResetCreditsRequest()
+    {
+        using var home = new CodexTestHome();
+        CodexTestData.WriteAuth(CodexProfile.Default(home.Root), "personal", token: "personal-token");
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transport = new GatedResetCreditsTransport("{}", gate);
+        var reader = Reader(home.Root, transport, new InMemoryReaderStateStore(), new FakeClock(Now));
+
+        var snapshot = await reader.FetchAsync(Freshness.Standard).WaitAsync(TimeSpan.FromSeconds(5));
+
         Assert.Equal(ProviderStatusKind.Unsupported, snapshot.Status.Kind);
+        await transport.CreditsCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     private static CodexReader Reader(
@@ -510,15 +528,23 @@ public class CodexReaderTests
         }
     }
 
-    /// <summary>A transport whose reset-credits answer waits for the test to open the gate; usage
-    /// answers immediately with an empty body.</summary>
+    /// <summary>A transport whose reset-credits answer waits for the test's gate and records when
+    /// it is cancelled instead; usage answers with the body it was given.</summary>
     private sealed class GatedResetCreditsTransport : IHttpTransport
     {
+        private readonly string _usageBody;
         private readonly TaskCompletionSource _gate;
 
-        public GatedResetCreditsTransport(TaskCompletionSource gate) => this._gate = gate;
+        public GatedResetCreditsTransport(string usageBody, TaskCompletionSource gate)
+        {
+            this._usageBody = usageBody;
+            this._gate = gate;
+        }
 
         public TaskCompletionSource CreditsReached { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource CreditsCancelled { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task<HttpResponseMessage> SendAsync(
@@ -526,15 +552,26 @@ public class CodexReaderTests
             TimeSpan timeout,
             CancellationToken cancellationToken)
         {
+            var body = this._usageBody;
             if (request.RequestUri!.AbsolutePath.EndsWith("rate-limit-reset-credits", StringComparison.Ordinal))
             {
                 this.CreditsReached.SetResult();
-                await this._gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await this._gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    this.CreditsCancelled.SetResult();
+                    throw;
+                }
+
+                body = "{}";
             }
 
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+                Content = new StringContent(body, Encoding.UTF8, "application/json"),
             };
         }
     }
